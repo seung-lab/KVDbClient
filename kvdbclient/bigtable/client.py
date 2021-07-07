@@ -146,7 +146,7 @@ class Client(BTClient, SimpleClient):
         """Writes/updates entries with attributes."""
         rows = []
         for entry in entries:
-            rows.append(self._mutate_row(entry.key, entry.values(), entry.timestamp))
+            rows.append(self._mutate_row(entry.key, entry.values, entry.timestamp))
         self._write(rows)
 
     # PRIVATE METHODS
