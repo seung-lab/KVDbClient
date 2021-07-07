@@ -61,7 +61,7 @@ class SimpleClient(ABC):
 class EntryKey:
     def __init__(self, key: Any, serializer: Optional[Serializer] = UInt64String()):
         self._key = key
-        self._serializer = serializer
+        self._serializer = serializer.serialize
 
     def serialize(self) -> Any:
         return self._serializer(self._key)
