@@ -27,7 +27,10 @@ def partial_row_data_to_column_dict(
     new_column_dict = {}
     for family_id, column_dict in partial_row_data._cells.items():
         for column_key, column_values in column_dict.items():
-            column = _from_key(family_id, column_key)
+            try:
+                column = _from_key(family_id, column_key)
+            except KeyError:
+                continue
             new_column_dict[column] = column_values
     return new_column_dict
 
