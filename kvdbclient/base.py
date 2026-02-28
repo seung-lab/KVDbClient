@@ -77,6 +77,16 @@ class SimpleClient(ABC):
         self._version = None
         self._max_row_key_count = max_row_key_count
 
+    def close(self):
+        """Override in subclasses to release backend resources."""
+        pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+
     # ── Abstract: backend-specific primitives ────────────────────────────
 
     @abstractmethod

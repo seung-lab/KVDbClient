@@ -106,6 +106,9 @@ class Client(ClientWithIDGen, OperationLogger):
             max_row_key_count=config.MAX_ROW_KEY_COUNT,
         )
 
+    def close(self):
+        self._session.close()
+
     # ── Helpers ──────────────────────────────────────────────────────────
 
     def _url(self, path: str) -> str:

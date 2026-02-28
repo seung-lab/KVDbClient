@@ -1,5 +1,6 @@
 # pylint: disable=invalid-name, missing-docstring, line-too-long, logging-fstring-interpolation, too-many-arguments
 
+import atexit
 import typing
 import logging
 import weakref
@@ -124,6 +125,10 @@ class Client(ClientWithIDGen, OperationLogger):
         self._finalizer = weakref.finalize(
             self, Client._shutdown, self._data_client
         )
+        atexit.register(self._finalizer)
+
+    def close(self):
+        self._finalizer()
 
     @staticmethod
     def _shutdown(data_client):
