@@ -1,6 +1,25 @@
 [build-system]
-requires = [
-    "setuptools>=42",
-    "wheel"
-]
+requires = ["setuptools>=64"]
 build-backend = "setuptools.build_meta"
+
+[project]
+name = "kvdbclient"
+version = "0.3.0"
+requires-python = ">=3.11"
+dependencies = [
+    "numpy",
+    "zstandard>=0.23.0",
+    "pytz",
+    "google-cloud-bigtable>=2.26.0",
+    "requests>=2.25.0",
+    "tenacity",
+]
+
+[tool.setuptools.packages.find]
+include = ["kvdbclient*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+filterwarnings = [
+    "ignore:Connecting to Bigtable emulator:RuntimeWarning",
+]

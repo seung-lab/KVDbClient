@@ -1,8 +1,0 @@
-grpcio>=1.36.1
-certifi>=2020.12.5
-google-cloud-bigtable
-numpy
-multiwrapper
-zstandard
-codecov
-

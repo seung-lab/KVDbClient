@@ -1,9 +1,5 @@
 from collections import namedtuple
-from typing import Any
-from typing import Iterable
-from typing import Tuple
-
-from .attributes import Attribute
+from os import environ
 
 DEFAULT_PROJECT = "neuromancer-seung-import"
 DEFAULT_INSTANCE = "pychunkedgraph"
@@ -14,28 +10,28 @@ _bigtableconfig_fields = (
     "ADMIN",
     "READ_ONLY",
     "CREDENTIALS",
+    "MAX_ROW_KEY_COUNT"
 )
 _bigtableconfig_defaults = (
-    DEFAULT_PROJECT,
-    DEFAULT_INSTANCE,
-    True,
+    environ.get("BIGTABLE_PROJECT", DEFAULT_PROJECT),
+    environ.get("BIGTABLE_INSTANCE", DEFAULT_INSTANCE),
     False,
+    True,
     None,
+    10000
 )
 BigTableConfig = namedtuple(
     "BigTableConfig", _bigtableconfig_fields, defaults=_bigtableconfig_defaults
 )
 
 
-def get_client_config(
+def get_client_info(
     project: str = None,
     instance: str = None,
     admin: bool = False,
     read_only: bool = True,
 ):
     """Helper function to load config from env."""
-    from os import environ
-
     _project = environ.get("BIGTABLE_PROJECT", DEFAULT_PROJECT)
     if project:
         _project = project

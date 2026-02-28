@@ -1,12 +1,12 @@
+from typing import Any, Iterable
 import json
 import pickle
-from typing import Any
 
 import numpy as np
 import zstandard as zstd
 
 
-class Serializer:
+class _Serializer:
     def __init__(self, serializer, deserializer, basetype=Any, compression_level=None):
         self._serializer = serializer
         self._deserializer = deserializer
@@ -29,7 +29,7 @@ class Serializer:
         return self._basetype
 
 
-class NumPyArray(Serializer):
+class NumPyArray(_Serializer):
     @staticmethod
     def _deserialize(val, dtype, shape=None, order=None):
         data = np.frombuffer(val, dtype=dtype)
@@ -41,7 +41,9 @@ class NumPyArray(Serializer):
 
     def __init__(self, dtype, shape=None, order=None, compression_level=None):
         super().__init__(
-            serializer=lambda x: x.newbyteorder(dtype.byteorder).tobytes(),
+            serializer=lambda x: np.asarray(x)
+            .view(x.dtype.newbyteorder(dtype.byteorder))
+            .tobytes(),
             deserializer=lambda x: NumPyArray._deserialize(
                 x, dtype, shape=shape, order=order
             ),
@@ -50,16 +52,18 @@ class NumPyArray(Serializer):
         )
 
 
-class NumPyValue(Serializer):
+class NumPyValue(_Serializer):
     def __init__(self, dtype):
         super().__init__(
-            serializer=lambda x: x.newbyteorder(dtype.byteorder).tobytes(),
+            serializer=lambda x: np.asarray(x)
+            .view(np.dtype(type(x)).newbyteorder(dtype.byteorder))
+            .tobytes(),
             deserializer=lambda x: np.frombuffer(x, dtype=dtype)[0],
             basetype=dtype.type,
         )
 
 
-class String(Serializer):
+class String(_Serializer):
     def __init__(self, encoding="utf-8"):
         super().__init__(
             serializer=lambda x: x.encode(encoding),
@@ -68,7 +72,7 @@ class String(Serializer):
         )
 
 
-class JSON(Serializer):
+class JSON(_Serializer):
     def __init__(self):
         super().__init__(
             serializer=lambda x: json.dumps(x).encode("utf-8"),
@@ -77,7 +81,7 @@ class JSON(Serializer):
         )
 
 
-class Pickle(Serializer):
+class Pickle(_Serializer):
     def __init__(self):
         super().__init__(
             serializer=lambda x: pickle.dumps(x),
@@ -86,7 +90,7 @@ class Pickle(Serializer):
         )
 
 
-class UInt64String(Serializer):
+class UInt64String(_Serializer):
     def __init__(self):
         super().__init__(
             serializer=serialize_uint64,
@@ -95,26 +99,72 @@ class UInt64String(Serializer):
         )
 
 
-def pad_uint64(key: np.uint64) -> str:
-    """Pad key id to 20 digits."""
-    return "%.20d" % key
+def pad_node_id(node_id: np.uint64) -> str:
+    """Pad node id to 20 digits
+
+    :param node_id: int
+    :return: str
+    """
+    return "%.20d" % node_id
 
 
-def serialize_uint64(key: np.uint64) -> bytes:
-    """Serializes a numpy int for use as BigTable row key."""
-    return serialize_key(pad_uint64(key))  # type: ignore
+def serialize_uint64(node_id: np.uint64, counter=False, fake_edges=False) -> bytes:
+    """Serializes an id to be ingested by a bigtable table row
+
+    :param node_id: int
+    :return: str
+    """
+    if counter:
+        return serialize_key("i%s" % pad_node_id(node_id))  # type: ignore
+    if fake_edges:
+        return serialize_key("f%s" % pad_node_id(node_id))  # type: ignore
+    return serialize_key(pad_node_id(node_id))  # type: ignore
 
 
-def deserialize_uint64(key: bytes) -> np.uint64:
-    """De-serializes a key from a BigTable row."""
-    return np.uint64(key.decode())  # type: ignore
+def serialize_uint64_batch(node_ids: Iterable[np.uint64], fake_edges: bool = False) -> list:
+    """Batch-serialize node IDs to row keys.
+
+    Inlines pad_node_id + serialize_key into a single f-string per element
+    to avoid per-ID function call overhead at scale (100K+ IDs).
+    """
+    prefix = "f" if fake_edges else ""
+    return [f"{prefix}{int(nid):020d}".encode("utf-8") for nid in node_ids]
+
+
+def serialize_uint64s_to_regex(node_ids: Iterable[np.uint64]) -> bytes:
+    """Serializes an id to be ingested by a bigtable table row
+
+    :param node_id: int
+    :return: str
+    """
+    node_id_str = "".join(["%s|" % pad_node_id(node_id) for node_id in node_ids])[:-1]
+    return serialize_key(node_id_str)  # type: ignore
+
+
+def deserialize_uint64(node_id: bytes, fake_edges=False) -> np.uint64:
+    """De-serializes a node id from a BigTable row
+
+    :param node_id: bytes
+    :return: np.uint64
+    """
+    if fake_edges:
+        return np.uint64(node_id[1:].decode())  # type: ignore
+    return np.uint64(node_id.decode())  # type: ignore
 
 
 def serialize_key(key: str) -> bytes:
-    """Serializes a key for use as BigTable row key."""
+    """Serializes a key to be ingested by a bigtable table row
+
+    :param key: str
+    :return: bytes
+    """
     return key.encode("utf-8")
 
 
 def deserialize_key(key: bytes) -> str:
-    """Deserializes a row key."""
+    """Deserializes a row key
+
+    :param key: bytes
+    :return: str
+    """
     return key.decode()
