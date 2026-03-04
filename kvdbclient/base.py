@@ -541,6 +541,13 @@ class ClientWithIDGen(SimpleClient):
     ) -> basetypes.NODE_ID:
         return self.create_node_ids(chunk_id, 1, root_chunk=root_chunk)[0]
 
+    def set_max_node_id(
+        self, chunk_id: np.uint64, node_id: np.uint64
+    ) -> None:
+        """Set max segment ID for a given chunk."""
+        size = int(np.uint64(chunk_id) ^ np.uint64(node_id))
+        self._get_ids_range(serialize_uint64(chunk_id, counter=True), size)
+
     def get_max_node_id(
         self, chunk_id: basetypes.CHUNK_ID, root_chunk=False
     ) -> basetypes.NODE_ID:

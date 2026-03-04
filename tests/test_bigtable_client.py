@@ -400,6 +400,42 @@ class TestNodeIds:
         max_id = bt_client.get_max_node_id(chunk_id)
         assert max_id > chunk_id
 
+    def test_set_max_node_id_fresh(self, bt_client):
+        """On a fresh counter, set_max_node_id sets the counter to the segment ID."""
+        chunk_id = np.uint64(1 << 32)
+        node_id = chunk_id | np.uint64(10)
+        bt_client.set_max_node_id(chunk_id, node_id)
+        max_id = bt_client.get_max_node_id(chunk_id)
+        assert max_id == node_id
+
+    def test_set_max_node_id_then_create_no_collision(self, bt_client):
+        """After set_max_node_id, create_node_id should return IDs above the set max."""
+        chunk_id = np.uint64(1 << 32)
+        node_id = chunk_id | np.uint64(10)
+        bt_client.set_max_node_id(chunk_id, node_id)
+        new_id = bt_client.create_node_id(chunk_id)
+        segment_id = int(np.uint64(new_id) ^ np.uint64(chunk_id))
+        assert segment_id > 10
+
+    def test_set_max_node_id_is_additive(self, bt_client):
+        """Calling set_max_node_id twice increments cumulatively (not idempotent)."""
+        chunk_id = np.uint64(1 << 32)
+        node_id = chunk_id | np.uint64(5)
+        bt_client.set_max_node_id(chunk_id, node_id)
+        bt_client.set_max_node_id(chunk_id, node_id)
+        max_id = bt_client.get_max_node_id(chunk_id)
+        # Counter was incremented by 5 twice -> segment_id is 10
+        assert int(np.uint64(max_id) ^ np.uint64(chunk_id)) == 10
+
+    def test_set_max_node_id_after_create(self, bt_client):
+        """set_max_node_id after create_node_ids advances counter further."""
+        chunk_id = np.uint64(1 << 32)
+        bt_client.create_node_ids(chunk_id, 3)  # counter at 3
+        node_id = chunk_id | np.uint64(7)
+        bt_client.set_max_node_id(chunk_id, node_id)  # increments by 7 -> counter at 10
+        max_id = bt_client.get_max_node_id(chunk_id)
+        assert int(np.uint64(max_id) ^ np.uint64(chunk_id)) == 10
+
 
 class TestOperationIds:
     def test_create_unique(self, bt_client):
