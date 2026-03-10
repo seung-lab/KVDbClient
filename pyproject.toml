@@ -15,6 +15,9 @@ dependencies = [
     "tenacity",
 ]
 
+[project.optional-dependencies]
+extensions = ["cloud-volume"]
+
 [tool.setuptools.packages.find]
 include = ["kvdbclient*"]
 
@@ -22,4 +25,5 @@ include = ["kvdbclient*"]
 testpaths = ["tests"]
 filterwarnings = [
     "ignore:Connecting to Bigtable emulator:RuntimeWarning",
+    "ignore:urllib3",
 ]

@@ -18,6 +18,7 @@ from .serializers import serialize_key
 from .serializers import serialize_uint64
 from .serializers import serialize_uint64_batch
 from .serializers import deserialize_uint64
+from .extensions import RootExtension
 
 
 @dataclass(frozen=True)
@@ -58,6 +59,9 @@ class Cell:
     def __hash__(self):
         return hash((self.value, self.timestamp))
 
+    def __repr__(self):
+        return f"Cell(value={self.value!r}, timestamp={self.timestamp!r})"
+
 
 class SimpleClient(ABC):
     """
@@ -76,6 +80,13 @@ class SimpleClient(ABC):
         self._lock_expiry = lock_expiry
         self._version = None
         self._max_row_key_count = max_row_key_count
+        self._root_ext = None
+
+    @property
+    def root_ext(self):
+        if self._root_ext is None:
+            self._root_ext = RootExtension(self)
+        return self._root_ext
 
     def close(self):
         """Override in subclasses to release backend resources."""
@@ -205,7 +216,10 @@ class SimpleClient(ABC):
 
     def read_table_meta(self):
         row = self._read_byte_row(attributes.TableMeta.key)
-        self._table_meta = row[attributes.TableMeta.Meta][0].value
+        try:
+            self._table_meta = row[attributes.TableMeta.Meta][0].value
+        except KeyError:
+            self._table_meta = None
         return self._table_meta
 
     def read_nodes(

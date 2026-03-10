@@ -266,8 +266,7 @@ class TestDelete:
 
     def test_delete_meta(self, bt_client):
         bt_client._delete_meta()
-        with pytest.raises(KeyError):
-            bt_client.read_table_meta()
+        assert bt_client.read_table_meta() is None
 
 
 # ── Locking ───────────────────────────────────────────────────────────────

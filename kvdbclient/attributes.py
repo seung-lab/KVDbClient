@@ -186,6 +186,14 @@ class Hierarchy:
     )
 
 
+class GraphSettings:
+    """PCGv1 graph configuration row (row key b'params')."""
+    key = b"params"
+    LayerCount = _Attribute(
+        key=b"n_layers", family_id="0", serializer=serializers.NumPyValue(dtype=basetypes.LAYERCOUNT)
+    )
+
+
 class TableMeta:
     key = b"meta"
     Meta = _Attribute(key=key, family_id="0", serializer=serializers.Pickle())

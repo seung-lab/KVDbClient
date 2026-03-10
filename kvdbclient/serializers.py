@@ -2,8 +2,12 @@ from typing import Any, Iterable
 import json
 import pickle
 
+import io
+
 import numpy as np
 import zstandard as zstd
+
+_ZSTD_MAGIC = b"\x28\xb5\x2f\xfd"
 
 
 class _Serializer:
@@ -20,7 +24,7 @@ class _Serializer:
         return content
 
     def deserialize(self, obj):
-        if self._compression_level:
+        if self._compression_level and obj[:4] == _ZSTD_MAGIC:
             obj = zstd.ZstdDecompressor().decompressobj().decompress(obj)
         return self._deserializer(obj)
 
@@ -81,13 +85,42 @@ class JSON(_Serializer):
         )
 
 
+class _Surrogate:
+    """Stand-in for unknown classes during lenient unpickling."""
+    def __new__(cls, *args):
+        obj = object.__new__(cls)
+        if args:
+            obj._surrogate_args = args  # preserve namedtuple positional fields
+        return obj
+    def __init__(self, *_):
+        pass
+    def __setstate__(self, state):
+        if isinstance(state, dict):
+            self.__dict__.update(state)
+
+
+class _LenientUnpickler(pickle.Unpickler):
+    """Unpickler that replaces unknown classes with _Surrogate."""
+    def find_class(self, module, name):
+        try:
+            return super().find_class(module, name)
+        except (ModuleNotFoundError, AttributeError, ImportError):
+            return _Surrogate
+
+
 class Pickle(_Serializer):
     def __init__(self):
         super().__init__(
             serializer=lambda x: pickle.dumps(x),
-            deserializer=lambda x: pickle.loads(x),
+            deserializer=pickle.loads,
             basetype=str,
         )
+
+    def deserialize(self, obj):
+        try:
+            return pickle.loads(obj)
+        except (ModuleNotFoundError, ImportError, AttributeError):
+            return _LenientUnpickler(io.BytesIO(obj)).load()
 
 
 class UInt64String(_Serializer):

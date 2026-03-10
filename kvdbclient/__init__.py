@@ -17,9 +17,12 @@ making it possible to use any unique features these solutions may provide.
 Please see `base.py` for more details.
 """
 
+import warnings
 from collections import namedtuple
 from os import environ
 from typing import Union
+
+warnings.filterwarnings("ignore", message="urllib3", module="requests")
 
 from .base import ColumnFamilyConfig, DEFAULT_COLUMN_FAMILIES
 from .bigtable import BigTableConfig
