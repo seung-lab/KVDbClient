@@ -1,5 +1,3 @@
-# KVDbClient
-
 [![codecov](https://codecov.io/gh/seung-lab/KVDbClient/graph/badge.svg)](https://app.codecov.io/gh/seung-lab/KVDbClient)
 
 A Python client library providing a unified interface for key-value database backends. Currently supports Google Cloud BigTable and Apache HBase.
@@ -16,6 +14,7 @@ Built for:
 
 ```bash
 pip install kvdbclient
+pip install kvdbclient[extensions]
 ```
 
 For development:
