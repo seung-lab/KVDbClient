@@ -139,6 +139,25 @@ class Connectivity:
         serializer=serializers.NumPyArray(dtype=basetypes.NODE_ID, shape=(-1, 2)),
     )
 
+    # compacted split edges — single cell with only currently-valid edges
+    CompactedSplitEdges = _Attribute(
+        key=b"compacted_split_edges",
+        family_id="4",
+        serializer=serializers.NumPyArray(dtype=basetypes.NODE_ID, shape=(-1, 2)),
+    )
+
+    CompactedAffinity = _Attribute(
+        key=b"compacted_affinities",
+        family_id="4",
+        serializer=serializers.NumPyArray(dtype=basetypes.EDGE_AFFINITY),
+    )
+
+    CompactedArea = _Attribute(
+        key=b"compacted_areas",
+        family_id="4",
+        serializer=serializers.NumPyArray(dtype=basetypes.EDGE_AREA),
+    )
+
 
 class Hierarchy:
     Child = _Attribute(
