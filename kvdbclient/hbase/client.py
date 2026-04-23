@@ -109,8 +109,6 @@ class Client(ClientWithIDGen, OperationLogger):
     def close(self):
         self._session.close()
 
-    # ── Helpers ──────────────────────────────────────────────────────────
-
     def _url(self, path: str) -> str:
         return f"{self._base_url}/{path}"
 
@@ -134,8 +132,6 @@ class Client(ClientWithIDGen, OperationLogger):
         }
         resp = self._session.put(self._table_url("/schema"), json=schema)
         resp.raise_for_status()
-
-    # ── Admin ────────────────────────────────────────────────────────────
 
     def create_table(self, meta, version: str, column_families=None) -> None:
         resp = self._session.get(self._table_url("/schema"))
@@ -164,8 +160,6 @@ class Client(ClientWithIDGen, OperationLogger):
                     cf_entry["TTL"] = str(int(gc_rule.max_age.total_seconds()))
         resp = self._session.put(self._table_url("/schema"), json=schema)
         resp.raise_for_status()
-
-    # ── Write ────────────────────────────────────────────────────────────
 
     def mutate_row(
         self,
@@ -204,15 +198,15 @@ class Client(ClientWithIDGen, OperationLogger):
         )
         resp.raise_for_status()
 
-    # ── Locking ──────────────────────────────────────────────────────────
+    def _acquire_lock_cell(
+        self, row_key: bytes, operation_id: np.uint64, lock_column
+    ) -> bool:
+        """Set the given lock cell iff it's absent. Returns True if acquired.
 
-    def lock_root(self, root_id: np.uint64, operation_id: np.uint64) -> bool:
-        lock_column = attributes.Concurrency.Lock
-        lock_expiry = self._lock_expiry
-        row_key = serialize_uint64(root_id)
-
-        lock_value = serialize_uint64(operation_id)
-        timestamp = get_valid_timestamp(None)
+        On failure due to a stale (expired) cell, deletes it and retries —
+        HBase REST check-and-put has no server-side TTL, so expiry is
+        enforced client-side against `self._lock_expiry`.
+        """
         success = self._check_and_put(
             row_key=row_key,
             check_family=lock_column.family_id,
@@ -220,97 +214,169 @@ class Client(ClientWithIDGen, OperationLogger):
             check_value=None,
             put_family=lock_column.family_id,
             put_qualifier=lock_column.key,
-            put_value=lock_value,
-            put_timestamp=timestamp,
+            put_value=serialize_uint64(operation_id),
+            put_timestamp=get_valid_timestamp(None),
         )
-
         if success:
-            # Verify no indefinite lock (mirrors BigTable's RowFilterUnion check).
-            # HBase REST checkAndPut only supports single-column checks, so we
-            # acquire then verify, rolling back if an indefinite lock exists.
-            indefinite_lock_column = attributes.Concurrency.IndefiniteLock
-            if self._read_byte_row(row_key, columns=indefinite_lock_column):
-                self._delete_cell(row_key, lock_column.family_id, lock_column.key)
-                return False
             return True
-
         cells = self._read_byte_row(row_key, columns=lock_column)
         if cells:
             lock_ts = cells[0].timestamp
-            if lock_ts and datetime.now(timezone.utc) - lock_ts > lock_expiry:
+            if lock_ts and datetime.now(timezone.utc) - lock_ts > self._lock_expiry:
                 self._delete_cell(row_key, lock_column.family_id, lock_column.key)
-                return self.lock_root(root_id, operation_id)
+                return self._acquire_lock_cell(row_key, operation_id, lock_column)
             if self.logger.isEnabledFor(logging.DEBUG):
                 self.logger.debug(f"Locked operation ids: {[c.value for c in cells]}")
         return False
 
-    def lock_root_indefinitely(self, root_id: np.uint64, operation_id: np.uint64) -> bool:
-        lock_column = attributes.Concurrency.IndefiniteLock
-        row_key = serialize_uint64(root_id)
-
-        lock_value = serialize_uint64(operation_id)
-        timestamp = get_valid_timestamp(None)
-        success = self._check_and_put(
-            row_key=row_key,
-            check_family=lock_column.family_id,
-            check_qualifier=lock_column.key,
-            check_value=None,
-            put_family=lock_column.family_id,
-            put_qualifier=lock_column.key,
-            put_value=lock_value,
-            put_timestamp=timestamp,
-        )
-        if not success:
-            if self.logger.isEnabledFor(logging.DEBUG):
-                cells = self._read_byte_row(row_key, columns=lock_column)
-                if cells:
-                    self.logger.debug(f"Indefinitely locked operation ids: {[c.value for c in cells]}")
-            return False
-        return True
-
-    def unlock_root(self, root_id: np.uint64, operation_id: np.uint64):
-        lock_column = attributes.Concurrency.Lock
-        row_key = serialize_uint64(root_id)
-        lock_value = serialize_uint64(operation_id)
+    def _release_lock_cell(
+        self, row_key: bytes, operation_id: np.uint64, lock_column
+    ) -> bool:
         return self._check_and_delete(
             row_key=row_key,
             check_family=lock_column.family_id,
             check_qualifier=lock_column.key,
-            check_value=lock_value,
+            check_value=serialize_uint64(operation_id),
         )
 
-    def unlock_indefinitely_locked_root(self, root_id: np.uint64, operation_id: np.uint64):
-        lock_column = attributes.Concurrency.IndefiniteLock
-        row_key = serialize_uint64(root_id)
-        lock_value = serialize_uint64(operation_id)
-        return self._check_and_delete(
-            row_key=row_key,
-            check_family=lock_column.family_id,
-            check_qualifier=lock_column.key,
-            check_value=lock_value,
-        )
-
-    def renew_lock(self, root_id: np.uint64, operation_id: np.uint64) -> bool:
-        lock_column = attributes.Concurrency.Lock
-        row_key = serialize_uint64(root_id)
-        lock_value = serialize_uint64(operation_id)
-
+    def _renew_lock_cell(
+        self, row_key: bytes, operation_id: np.uint64, lock_column
+    ) -> bool:
         return self._check_and_put(
             row_key=row_key,
             check_family=lock_column.family_id,
             check_qualifier=lock_column.key,
-            check_value=lock_value,
+            check_value=serialize_uint64(operation_id),
             put_family=lock_column.family_id,
             put_qualifier=lock_column.key,
             put_value=lock_column.serialize(operation_id),
         )
 
-    # ── Timestamp ────────────────────────────────────────────────────────
+    def lock_root(self, root_id: np.uint64, operation_id: np.uint64) -> bool:
+        lock_column = attributes.Concurrency.Lock
+        row_key = serialize_uint64(root_id)
+        if not self._acquire_lock_cell(row_key, operation_id, lock_column):
+            return False
+        # Root-specific guard: an indefinite lock on the same row must
+        # block acquisition. HBase REST check-and-put only checks one
+        # column, so we acquire the temporal lock and then verify the
+        # indefinite column is empty, rolling back if not.
+        indefinite_lock_column = attributes.Concurrency.IndefiniteLock
+        if self._read_byte_row(row_key, columns=indefinite_lock_column):
+            self._delete_cell(row_key, lock_column.family_id, lock_column.key)
+            return False
+        return True
+
+    def lock_root_indefinitely(self, root_id: np.uint64, operation_id: np.uint64) -> bool:
+        # Not routed through `_acquire_lock_cell` on purpose: that helper
+        # treats stale cells as expired and deletes them, but indefinite
+        # locks never expire — so a stale-looking cell here is still held.
+        lock_column = attributes.Concurrency.IndefiniteLock
+        row_key = serialize_uint64(root_id)
+        success = self._check_and_put(
+            row_key=row_key,
+            check_family=lock_column.family_id,
+            check_qualifier=lock_column.key,
+            check_value=None,
+            put_family=lock_column.family_id,
+            put_qualifier=lock_column.key,
+            put_value=serialize_uint64(operation_id),
+            put_timestamp=get_valid_timestamp(None),
+        )
+        if success:
+            return True
+        if self.logger.isEnabledFor(logging.DEBUG):
+            cells = self._read_byte_row(row_key, columns=lock_column)
+            if cells:
+                self.logger.debug(
+                    f"Indefinitely locked operation ids: {[c.value for c in cells]}"
+                )
+        return False
+
+    def unlock_root(self, root_id: np.uint64, operation_id: np.uint64):
+        return self._release_lock_cell(
+            serialize_uint64(root_id), operation_id, attributes.Concurrency.Lock
+        )
+
+    def unlock_indefinitely_locked_root(self, root_id: np.uint64, operation_id: np.uint64):
+        return self._release_lock_cell(
+            serialize_uint64(root_id),
+            operation_id,
+            attributes.Concurrency.IndefiniteLock,
+        )
+
+    def renew_lock(self, root_id: np.uint64, operation_id: np.uint64) -> bool:
+        return self._renew_lock_cell(
+            serialize_uint64(root_id), operation_id, attributes.Concurrency.Lock
+        )
+
+    def lock_by_row_key(self, row_key: bytes, operation_id: np.uint64) -> bool:
+        return self._acquire_lock_cell(
+            row_key, operation_id, attributes.Concurrency.Lock
+        )
+
+    def lock_by_row_key_with_indefinite(
+        self, row_key: bytes, operation_id: np.uint64
+    ) -> bool:
+        """Temporal lock on a row key that also refuses if indefinite is held.
+
+        HBase REST check-and-put only checks a single column, so we take
+        the temporal lock first and then verify the indefinite column is
+        empty, rolling back the temporal cell if it isn't. Mirrors the
+        pattern `lock_root` uses for the same guard.
+        """
+        lock_column = attributes.Concurrency.Lock
+        if not self._acquire_lock_cell(row_key, operation_id, lock_column):
+            return False
+        indefinite_lock_column = attributes.Concurrency.IndefiniteLock
+        if self._read_byte_row(row_key, columns=indefinite_lock_column):
+            self._delete_cell(row_key, lock_column.family_id, lock_column.key)
+            return False
+        return True
+
+    def lock_by_row_key_indefinitely(
+        self, row_key: bytes, operation_id: np.uint64
+    ) -> bool:
+        """Indefinite-column CAS on a row key. Same persistence contract
+        as `lock_root_indefinitely`: the cell survives until explicitly
+        released or operator recovery clears it, so a stale-looking cell
+        here is still held.
+        """
+        lock_column = attributes.Concurrency.IndefiniteLock
+        success = self._check_and_put(
+            row_key=row_key,
+            check_family=lock_column.family_id,
+            check_qualifier=lock_column.key,
+            check_value=None,
+            put_family=lock_column.family_id,
+            put_qualifier=lock_column.key,
+            put_value=serialize_uint64(operation_id),
+            put_timestamp=get_valid_timestamp(None),
+        )
+        return bool(success)
+
+    def unlock_by_row_key(self, row_key: bytes, operation_id: np.uint64):
+        return self._release_lock_cell(
+            row_key, operation_id, attributes.Concurrency.Lock
+        )
+
+    def unlock_indefinitely_locked_by_row_key(
+        self, row_key: bytes, operation_id: np.uint64
+    ):
+        """Release an indefinite row-key lock previously acquired by
+        `lock_by_row_key_indefinitely`.
+        """
+        return self._release_lock_cell(
+            row_key, operation_id, attributes.Concurrency.IndefiniteLock
+        )
+
+    def renew_lock_by_row_key(self, row_key: bytes, operation_id: np.uint64) -> bool:
+        return self._renew_lock_cell(
+            row_key, operation_id, attributes.Concurrency.Lock
+        )
 
     def get_compatible_timestamp(self, time_stamp: datetime, round_up: bool = False) -> datetime:
         return hbase_utils.get_hbase_compatible_time_stamp(time_stamp, round_up=round_up)
-
-    # ── IDs ──────────────────────────────────────────────────────────────
 
     def _get_ids_range(self, key: bytes, size: int) -> typing.Tuple:
         column = attributes.Concurrency.Counter
@@ -335,8 +401,6 @@ class Client(ClientWithIDGen, OperationLogger):
         resp.raise_for_status()
         high = struct.unpack(">q", resp.content)[0]
         return np.uint64(high + 1 - size), np.uint64(high)
-
-    # ── Read ─────────────────────────────────────────────────────────────
 
     def read_all_rows(self):
         scanner_url = self._table_url("/scanner")
@@ -466,8 +530,6 @@ class Client(ClientWithIDGen, OperationLogger):
             self._session.delete(scanner_location)
         return result
 
-    # ── Delete ───────────────────────────────────────────────────────────
-
     def _delete_meta(self):
         key_b64 = hbase_utils.encode_value(attributes.TableMeta.key)
         self._session.delete(self._table_url(f"/{key_b64}"))
@@ -487,8 +549,6 @@ class Client(ClientWithIDGen, OperationLogger):
     def delete_row(self, row_key):
         key_b64 = hbase_utils.encode_value(row_key)
         self._session.delete(self._table_url(f"/{key_b64}"))
-
-    # ── Private Lock Helpers ─────────────────────────────────────────────
 
     def _check_and_put(
         self,

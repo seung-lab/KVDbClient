@@ -137,8 +137,6 @@ class Client(ClientWithIDGen, OperationLogger):
         except Exception:
             pass
 
-    # ── Admin ────────────────────────────────────────────────────────────
-
     @property
     def _admin_table(self):
         if self.__admin_table is None:
@@ -186,8 +184,6 @@ class Client(ClientWithIDGen, OperationLogger):
         f = self._admin_table.column_family(family_id, gc_rule=gc_rule)
         f.create()
 
-    # ── Write ────────────────────────────────────────────────────────────
-
     def mutate_row(
         self,
         row_key: bytes,
@@ -231,7 +227,19 @@ class Client(ClientWithIDGen, OperationLogger):
                 f"Bulk write failed: {exc}"
             ) from exc
 
-    # ── Locking ──────────────────────────────────────────────────────────
+    def _set_lock_mutation(self, lock_column, operation_id: np.uint64) -> SetCell:
+        return SetCell(
+            family=lock_column.family_id,
+            qualifier=lock_column.key,
+            new_value=lock_column.serialize(operation_id),
+            timestamp_micros=_datetime_to_micros(get_valid_timestamp(None)),
+        )
+
+    def _delete_lock_mutation(self, lock_column) -> DeleteRangeFromColumn:
+        return DeleteRangeFromColumn(
+            family=lock_column.family_id,
+            qualifier=lock_column.key,
+        )
 
     def lock_root(self, root_id: np.uint64, operation_id: np.uint64) -> bool:
         lock_column = attributes.Concurrency.Lock
@@ -242,12 +250,7 @@ class Client(ClientWithIDGen, OperationLogger):
         lock_acquired = not self._table.check_and_mutate_row(
             serialize_uint64(root_id),
             predicate=filter_,
-            false_case_mutations=SetCell(
-                family=lock_column.family_id,
-                qualifier=lock_column.key,
-                new_value=serialize_uint64(operation_id),
-                timestamp_micros=_datetime_to_micros(get_valid_timestamp(None)),
-            ),
+            false_case_mutations=self._set_lock_mutation(lock_column, operation_id),
             operation_timeout=30.0,
         )
         if not lock_acquired and self.logger.isEnabledFor(logging.DEBUG):
@@ -262,12 +265,7 @@ class Client(ClientWithIDGen, OperationLogger):
         lock_acquired = not self._table.check_and_mutate_row(
             serialize_uint64(root_id),
             predicate=filter_,
-            false_case_mutations=SetCell(
-                family=lock_column.family_id,
-                qualifier=lock_column.key,
-                new_value=serialize_uint64(operation_id),
-                timestamp_micros=_datetime_to_micros(get_valid_timestamp(None)),
-            ),
+            false_case_mutations=self._set_lock_mutation(lock_column, operation_id),
             operation_timeout=30.0,
         )
         if not lock_acquired and self.logger.isEnabledFor(logging.DEBUG):
@@ -284,10 +282,7 @@ class Client(ClientWithIDGen, OperationLogger):
         return self._table.check_and_mutate_row(
             serialize_uint64(root_id),
             predicate=filter_,
-            true_case_mutations=DeleteRangeFromColumn(
-                family=lock_column.family_id,
-                qualifier=lock_column.key,
-            ),
+            true_case_mutations=self._delete_lock_mutation(lock_column),
             operation_timeout=30.0,
         )
 
@@ -296,33 +291,116 @@ class Client(ClientWithIDGen, OperationLogger):
         return self._table.check_and_mutate_row(
             serialize_uint64(root_id),
             predicate=utils.get_indefinite_unlock_root_filter(lock_column, operation_id),
-            true_case_mutations=DeleteRangeFromColumn(
-                family=lock_column.family_id,
-                qualifier=lock_column.key,
-            ),
+            true_case_mutations=self._delete_lock_mutation(lock_column),
             operation_timeout=30.0,
         )
 
     def renew_lock(self, root_id: np.uint64, operation_id: np.uint64) -> bool:
+        # Root-specific: ConditionalRowFilter inverts the usual renew
+        # semantics so SetCell runs as `false_case_mutations` (see
+        # `get_renew_lock_filter`). The generic `renew_lock_by_row_key`
+        # variant below uses the simpler `true_case_mutations` path.
         lock_column = attributes.Concurrency.Lock
         return not self._table.check_and_mutate_row(
             serialize_uint64(root_id),
             predicate=utils.get_renew_lock_filter(lock_column, operation_id),
-            false_case_mutations=SetCell(
-                family=lock_column.family_id,
-                qualifier=lock_column.key,
-                new_value=lock_column.serialize(operation_id),
-                timestamp_micros=_datetime_to_micros(get_valid_timestamp(None)),
-            ),
+            false_case_mutations=self._set_lock_mutation(lock_column, operation_id),
             operation_timeout=30.0,
         )
 
-    # ── Timestamp ────────────────────────────────────────────────────────
+    def lock_by_row_key(self, row_key: bytes, operation_id: np.uint64) -> bool:
+        lock_column = attributes.Concurrency.Lock
+        filter_ = utils.get_row_key_lock_filter(lock_column, self._lock_expiry)
+        return not self._table.check_and_mutate_row(
+            row_key,
+            predicate=filter_,
+            false_case_mutations=self._set_lock_mutation(lock_column, operation_id),
+            operation_timeout=30.0,
+        )
+
+    def lock_by_row_key_with_indefinite(
+        self, row_key: bytes, operation_id: np.uint64
+    ) -> bool:
+        """Temporal lock on a row key that also refuses if indefinite is held.
+
+        Mirrors `lock_root` (which already unions both columns via
+        `get_root_lock_filter`) but for the hierarchy-free row-key
+        scheme. Required for locks we plan to upgrade to indefinite —
+        without the union, a fresh temporal acquire could silently
+        succeed against a row whose indefinite cell was left set by a
+        crashed worker.
+        """
+        lock_column = attributes.Concurrency.Lock
+        indefinite_lock_column = attributes.Concurrency.IndefiniteLock
+        filter_ = utils.get_row_key_lock_filter_with_indefinite(
+            lock_column, self._lock_expiry, indefinite_lock_column
+        )
+        return not self._table.check_and_mutate_row(
+            row_key,
+            predicate=filter_,
+            false_case_mutations=self._set_lock_mutation(lock_column, operation_id),
+            operation_timeout=30.0,
+        )
+
+    def lock_by_row_key_indefinitely(
+        self, row_key: bytes, operation_id: np.uint64
+    ) -> bool:
+        """Indefinite-column CAS on a row key. No expiry semantics — a
+        cell here persists until explicitly released (or a worker
+        recovery path clears it). Counterpart to `lock_root_indefinitely`
+        for hierarchy-free rows.
+        """
+        lock_column = attributes.Concurrency.IndefiniteLock
+        return not self._table.check_and_mutate_row(
+            row_key,
+            predicate=utils.get_indefinite_row_key_lock_filter(lock_column),
+            false_case_mutations=self._set_lock_mutation(lock_column, operation_id),
+            operation_timeout=30.0,
+        )
+
+    def unlock_by_row_key(self, row_key: bytes, operation_id: np.uint64):
+        lock_column = attributes.Concurrency.Lock
+        # Reuses the root unlock filter: time-range + column + op_id
+        # value match — it's already hierarchy-agnostic.
+        filter_ = utils.get_unlock_root_filter(
+            lock_column, self._lock_expiry, operation_id
+        )
+        return self._table.check_and_mutate_row(
+            row_key,
+            predicate=filter_,
+            true_case_mutations=self._delete_lock_mutation(lock_column),
+            operation_timeout=30.0,
+        )
+
+    def unlock_indefinitely_locked_by_row_key(
+        self, row_key: bytes, operation_id: np.uint64
+    ):
+        """Release an indefinite row-key lock previously acquired by
+        `lock_by_row_key_indefinitely`. Deletes the cell only if its
+        value still matches `operation_id` — same safety as the root
+        variant: a crashed-then-stolen lock can't be released under the
+        current holder.
+        """
+        lock_column = attributes.Concurrency.IndefiniteLock
+        return self._table.check_and_mutate_row(
+            row_key,
+            predicate=utils.get_indefinite_unlock_root_filter(lock_column, operation_id),
+            true_case_mutations=self._delete_lock_mutation(lock_column),
+            operation_timeout=30.0,
+        )
+
+    def renew_lock_by_row_key(self, row_key: bytes, operation_id: np.uint64) -> bool:
+        lock_column = attributes.Concurrency.Lock
+        filter_ = utils.get_row_key_renew_lock_filter(lock_column, operation_id)
+        return bool(self._table.check_and_mutate_row(
+            row_key,
+            predicate=filter_,
+            true_case_mutations=self._set_lock_mutation(lock_column, operation_id),
+            operation_timeout=30.0,
+        ))
 
     def get_compatible_timestamp(self, time_stamp: datetime, round_up: bool = False) -> datetime:
         return utils.get_google_compatible_time_stamp(time_stamp, round_up=round_up)
-
-    # ── IDs ──────────────────────────────────────────────────────────────
 
     def _get_ids_range(self, key: bytes, size: int) -> typing.Tuple:
         column = attributes.Concurrency.Counter
@@ -333,8 +411,6 @@ class Client(ClientWithIDGen, OperationLogger):
         cells = result_row.get_cells(column.family_id, column.key)
         high = column.deserialize(cells[0].value)
         return high + np.uint64(1) - size, high
-
-    # ── Read ─────────────────────────────────────────────────────────────
 
     @staticmethod
     def _deserialize_column_dict(column_dict):
@@ -437,8 +513,6 @@ class Client(ClientWithIDGen, OperationLogger):
 
     def read_all_rows(self):
         return _ReadAllRowsResult(self._table.read_rows_stream(ReadRowsQuery()))
-
-    # ── Delete ───────────────────────────────────────────────────────────
 
     def _delete_meta(self):
         self._table.mutate_row(attributes.TableMeta.key, DeleteAllFromRow())
