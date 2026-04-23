@@ -85,8 +85,6 @@ class RootExtension:
         n_chunks = np.ceil(voxel_counts / chunk_size).astype(int)
         return int(np.ceil(np.log(np.max(n_chunks)) / np.log(fanout))) + 2
 
-    # ── Chunk layer extraction ───────────────────────────────────────────
-
     def get_chunk_layer(self, node_id: np.uint64) -> int:
         return int(int(node_id) >> (64 - self._layer_id_bits))
 
@@ -94,8 +92,6 @@ class RootExtension:
         if len(node_ids) == 0:
             return np.array([], dtype=int)
         return np.array(node_ids, dtype=int) >> (64 - self._layer_id_bits)
-
-    # ── Parent traversal ─────────────────────────────────────────────────
 
     def get_parent(
         self,
@@ -134,8 +130,6 @@ class RootExtension:
                 else:
                     raise
         return np.array(parents, dtype=basetypes.NODE_ID)
-
-    # ── Root queries ─────────────────────────────────────────────────────
 
     def is_root(self, node_id: np.uint64) -> bool:
         return self.get_chunk_layer(node_id) == self._layer_count
