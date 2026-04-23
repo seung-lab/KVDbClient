@@ -74,11 +74,18 @@ class TestOperationLogs:
     def test_all_returns_list(self):
         result = OperationLogs.all()
         assert isinstance(result, list)
-        assert len(result) == 16
-        assert OperationLogs.OperationID in result
-        assert OperationLogs.UserID in result
-        assert OperationLogs.RootID in result
-        assert OperationLogs.AddedEdge in result
+        # Representative sample — no brittle count. Any addition to the
+        # attribute set shouldn't break this test.
+        for attr in (
+            OperationLogs.OperationID,
+            OperationLogs.UserID,
+            OperationLogs.RootID,
+            OperationLogs.AddedEdge,
+            OperationLogs.Status,
+            OperationLogs.OperationTimeStamp,
+            OperationLogs.L2ChunkLockScope,
+        ):
+            assert attr in result
 
     def test_status_codes(self):
         assert OperationLogs.StatusCodes.SUCCESS.value == 0
