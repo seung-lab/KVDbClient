@@ -320,6 +320,17 @@ class OperationLogs:
         key=b"operation_ts", family_id="0", serializer=serializers.Pickle()
     )
 
+    # L2 chunk IDs the op acquired an indefinite lock on. Written when
+    # `IndefiniteL2ChunkLock.__enter__` takes the lock; cleared on clean
+    # `__exit__`. Persists through a worker crash, giving the operator
+    # recovery path (cleanup of partial OCDBT writes) a durable scope
+    # without a bigtable chunk-row scan.
+    L2ChunkLockScope = _Attribute(
+        key=b"l2_chunk_lock_scope",
+        family_id="0",
+        serializer=serializers.NumPyArray(dtype=basetypes.NODE_ID),
+    )
+
     @staticmethod
     def all():
         return [
@@ -339,6 +350,7 @@ class OperationLogs:
             OperationLogs.Status,
             OperationLogs.OperationException,
             OperationLogs.OperationTimeStamp,
+            OperationLogs.L2ChunkLockScope,
         ]
 
 
