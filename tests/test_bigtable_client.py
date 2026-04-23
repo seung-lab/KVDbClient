@@ -340,6 +340,58 @@ class TestRenewLock:
         assert bt_client.renew_lock(np.uint64(100), np.uint64(2)) is False
 
 
+class TestRowKeyIndefiniteLocks:
+    """Row-key counterparts to the root indefinite-lock primitives.
+
+    Verifies three contracts: (1) the temporal-with-indefinite acquire
+    refuses on any indefinite cell, (2) indefinite acquire is
+    single-winner, (3) indefinite release is op-id-gated.
+    """
+
+    def test_temporal_with_indefinite_refuses_when_indefinite_held(self, bt_client):
+        row = b"chunk\x01\x02\x03"
+        op1, op2 = np.uint64(1), np.uint64(2)
+        assert bt_client.lock_by_row_key_indefinitely(row, op1) is True
+        # A fresh temporal acquire must see the indefinite cell and refuse —
+        # this is the crash-safety guarantee `L2ChunkLock` relies on.
+        assert bt_client.lock_by_row_key_with_indefinite(row, op2) is False
+
+    def test_temporal_with_indefinite_refuses_when_temporal_held(self, bt_client):
+        row = b"chunk\x01\x02\x03"
+        op1, op2 = np.uint64(1), np.uint64(2)
+        assert bt_client.lock_by_row_key_with_indefinite(row, op1) is True
+        assert bt_client.lock_by_row_key_with_indefinite(row, op2) is False
+
+    def test_temporal_with_indefinite_acquires_on_clean_row(self, bt_client):
+        row = b"chunk\x01\x02\x03"
+        assert bt_client.lock_by_row_key_with_indefinite(row, np.uint64(1)) is True
+
+    def test_indefinite_double_lock_fails(self, bt_client):
+        row = b"chunk\x01\x02\x03"
+        assert bt_client.lock_by_row_key_indefinitely(row, np.uint64(1)) is True
+        assert bt_client.lock_by_row_key_indefinitely(row, np.uint64(2)) is False
+
+    def test_unlock_indefinite_allows_relock(self, bt_client):
+        row = b"chunk\x01\x02\x03"
+        op1, op2 = np.uint64(1), np.uint64(2)
+        assert bt_client.lock_by_row_key_indefinitely(row, op1) is True
+        bt_client.unlock_indefinitely_locked_by_row_key(row, op1)
+        assert bt_client.lock_by_row_key_indefinitely(row, op2) is True
+
+    def test_unlock_indefinite_wrong_op_id_leaves_held(self, bt_client):
+        row = b"chunk\x01\x02\x03"
+        op1, op2 = np.uint64(1), np.uint64(2)
+        assert bt_client.lock_by_row_key_indefinitely(row, op1) is True
+        bt_client.unlock_indefinitely_locked_by_row_key(row, op2)  # wrong op
+        assert bt_client.lock_by_row_key_indefinitely(row, op2) is False
+
+    def test_different_rows_independent(self, bt_client):
+        row_a = b"chunk_a"
+        row_b = b"chunk_b"
+        assert bt_client.lock_by_row_key_indefinitely(row_a, np.uint64(1)) is True
+        assert bt_client.lock_by_row_key_indefinitely(row_b, np.uint64(2)) is True
+
+
 class TestLockRoots:
     def test_all_succeed(self, bt_client):
         roots = [np.uint64(100), np.uint64(200)]

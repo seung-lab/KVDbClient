@@ -126,20 +126,60 @@ def get_time_range_and_column_filter(
     return filters[0]
 
 
-def get_root_lock_filter(
-    lock_column, lock_expiry, indefinite_lock_column
-) -> ConditionalRowFilter:
+def get_row_key_lock_filter(lock_column, lock_expiry) -> RowFilterChain:
+    """Acquire-side filter for a temporal CAS lock on an arbitrary row.
+
+    Matches any non-expired cell in the lock column. A match means the
+    lock is held, so `check_and_mutate_row` should NOT apply the acquire
+    mutation; an empty result means the row is free.
+
+    Used directly by `lock_by_row_key` and composed into
+    `get_root_lock_filter` (root locks layer extra hierarchy checks on
+    top of this same temporal match).
+    """
     time_cutoff = datetime.now(timezone.utc) - lock_expiry
     # Comply to resolution of BigTables TimeRange
     time_cutoff -= timedelta(microseconds=time_cutoff.microsecond % 1000)
-    time_filter = TimestampRangeFilter(start=time_cutoff)
+    return RowFilterChain([
+        TimestampRangeFilter(start=time_cutoff),
+        _exact_column_filter(lock_column),
+    ])
 
-    temporal_lock_filter = RowFilterChain([time_filter, _exact_column_filter(lock_column)])
+
+def get_root_lock_filter(
+    lock_column, lock_expiry, indefinite_lock_column
+) -> ConditionalRowFilter:
+    # Hierarchy-aware: also fails if an indefinite lock exists, and
+    # returns the NewParent column when no lock is held — so a superseded
+    # root (has NewParent) cannot be acquired even though its lock cell
+    # is free.
     return ConditionalRowFilter(
-        predicate_filter=RowFilterUnion([_exact_column_filter(indefinite_lock_column), temporal_lock_filter]),
+        predicate_filter=RowFilterUnion([
+            _exact_column_filter(indefinite_lock_column),
+            get_row_key_lock_filter(lock_column, lock_expiry),
+        ]),
         true_filter=PassAllFilter(True),
         false_filter=_exact_column_filter(attributes.Hierarchy.NewParent),
     )
+
+
+def get_row_key_lock_filter_with_indefinite(
+    lock_column, lock_expiry, indefinite_lock_column
+) -> RowFilterUnion:
+    """Acquire-side filter for a temporal row-key lock extended to fail
+    if an indefinite lock cell exists on the same row.
+
+    Counterpart to `get_root_lock_filter` but without the NewParent
+    hierarchy check (row-key locks have no lineage). Used for locks that
+    need the same crash-safety root locks have: a worker that dies
+    holding the indefinite column leaves that cell set, and a subsequent
+    temporal acquire must see it and refuse rather than racing into
+    partial state.
+    """
+    return RowFilterUnion([
+        _exact_column_filter(indefinite_lock_column),
+        get_row_key_lock_filter(lock_column, lock_expiry),
+    ])
 
 
 def get_indefinite_root_lock_filter(lock_column) -> ConditionalRowFilter:
@@ -150,13 +190,41 @@ def get_indefinite_root_lock_filter(lock_column) -> ConditionalRowFilter:
     )
 
 
+def get_indefinite_row_key_lock_filter(lock_column) -> ColumnRangeFilter:
+    """Acquire-side filter for an indefinite row-key lock.
+
+    Row-key variant of `get_indefinite_root_lock_filter` without the
+    NewParent hierarchy check. A match (indefinite cell exists) means
+    the lock is held → acquire refuses.
+    """
+    return _exact_column_filter(lock_column)
+
+
+def get_row_key_renew_lock_filter(
+    lock_column: attributes._Attribute, operation_id: np.uint64
+) -> RowFilterChain:
+    """'Is this lock still held by operation_id?' for generic row keys.
+
+    A match means our lock cell still exists → caller should renew (run
+    SetCell in `true_case_mutations`). No NewParent handling — arbitrary
+    rows have no hierarchy relationship.
+    """
+    return RowFilterChain([
+        _exact_column_filter(lock_column),
+        _exact_value_filter(lock_column.serialize(operation_id)),
+    ])
+
+
 def get_renew_lock_filter(
     lock_column: attributes._Attribute, operation_id: np.uint64
 ) -> ConditionalRowFilter:
-    operation_id_b = lock_column.serialize(operation_id)
-
+    # Root renew is inverted vs the row-key version: renew only when
+    # (my lock exists) AND (no NewParent). Layers a NewParent guard on
+    # top of the generic "is my lock still here" check, and flips the
+    # expected case so `check_and_mutate_row` runs SetCell as
+    # `false_case_mutations`.
     return ConditionalRowFilter(
-        predicate_filter=RowFilterChain([_exact_column_filter(lock_column), _exact_value_filter(operation_id_b)]),
+        predicate_filter=get_row_key_renew_lock_filter(lock_column, operation_id),
         true_filter=_exact_column_filter(attributes.Hierarchy.NewParent),
         false_filter=PassAllFilter(True),
     )

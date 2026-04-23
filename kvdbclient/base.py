@@ -98,8 +98,6 @@ class SimpleClient(ABC):
     def __exit__(self, *exc):
         self.close()
 
-    # ── Abstract: backend-specific primitives ────────────────────────────
-
     @abstractmethod
     def create_table(self, meta, version: str, column_families=None) -> None:
         """Initialize the table and store associated meta."""
@@ -147,6 +145,54 @@ class SimpleClient(ABC):
         """Renews existing node lock with operation_id for extended time."""
 
     @abstractmethod
+    def lock_by_row_key(self, row_key, operation_id):
+        """Lock an arbitrary row key.
+
+        Same temporal-expiry semantics as `lock_root` but with no
+        hierarchy or node-id coupling — the caller owns the row-key
+        encoding. Returns True if acquired.
+        """
+
+    @abstractmethod
+    def lock_by_row_key_with_indefinite(self, row_key, operation_id):
+        """Temporal lock on a row key that also refuses if an indefinite
+        lock cell exists on the same row.
+
+        Row-key counterpart to `lock_root` (which unions both columns in
+        its filter). Use for locks that will be upgraded to indefinite:
+        without this guard, a fresh temporal acquire could silently
+        succeed against a row whose indefinite cell was left set by a
+        crashed worker.
+        """
+
+    @abstractmethod
+    def lock_by_row_key_indefinitely(self, row_key, operation_id):
+        """Acquire the indefinite-column cell on a row key. No expiry;
+        persists until released or cleared by operator recovery. Row-key
+        counterpart to `lock_root_indefinitely`.
+        """
+
+    @abstractmethod
+    def unlock_by_row_key(self, row_key, operation_id):
+        """Release a lock previously acquired via `lock_by_row_key`.
+
+        Deletes the lock cell only if its value still matches
+        `operation_id`, so an expired-then-stolen lock can't be released
+        out from under the current holder.
+        """
+
+    @abstractmethod
+    def unlock_indefinitely_locked_by_row_key(self, row_key, operation_id):
+        """Release an indefinite row-key lock previously acquired by
+        `lock_by_row_key_indefinitely`. Same value-match safety as
+        `unlock_by_row_key`.
+        """
+
+    @abstractmethod
+    def renew_lock_by_row_key(self, row_key, operation_id):
+        """Extend the expiry of a lock acquired via `lock_by_row_key`."""
+
+    @abstractmethod
     def get_compatible_timestamp(self, time_stamp, round_up=False):
         """Datetime time stamp compatible with client's services."""
 
@@ -177,8 +223,6 @@ class SimpleClient(ABC):
     @abstractmethod
     def _delete_meta(self):
         """Delete the table meta row."""
-
-    # ── Concrete: shared logic ───────────────────────────────────────────
 
     @property
     def table_meta(self):
@@ -353,8 +397,6 @@ class SimpleClient(ABC):
             log_record.update((column, v[0].value) for column, v in log_record.items())
             log_record["timestamp"] = timestamp
         return logs_d
-
-    # ── Locking orchestration ────────────────────────────────────────────
 
     def lock_roots(
         self,
