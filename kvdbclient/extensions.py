@@ -1,3 +1,4 @@
+import json
 import typing
 from datetime import datetime
 
@@ -8,9 +9,9 @@ from . import basetypes
 from .utils import get_valid_timestamp
 
 try:
-    import cloudvolume as _cloudvolume
+    import tensorstore as ts
 except ImportError:
-    _cloudvolume = None
+    ts = None
 
 
 class RootExtension:
@@ -42,11 +43,11 @@ class RootExtension:
             meta = self._client.read_table_meta()
         if meta is not None:
             # Case 1: real ChunkedGraphMeta with pychunkedgraph installed —
-            # call the property which connects to CloudVolume (same as PCG does)
+            # call the property, which reads the watershed info (same as PCG does)
             if hasattr(meta, "layer_count"):
                 return int(meta.layer_count)
             # Case 2: _Surrogate from lenient unpickling (pychunkedgraph not installed /
-            # version mismatch) — extract namedtuple fields and compute via cloudvolume
+            # version mismatch) — extract namedtuple fields and compute via tensorstore
             lc = self._compute_layer_count_from_surrogate(meta)
             if lc is not None:
                 return lc
@@ -62,12 +63,12 @@ class RootExtension:
         raise RuntimeError("layer_count not found in table")
 
     def _compute_layer_count_from_surrogate(self, meta) -> typing.Optional[int]:
-        """Compute layer_count from a _Surrogate ChunkedGraphMeta via CloudVolume.
+        """Compute layer_count from a _Surrogate ChunkedGraphMeta via tensorstore.
 
         GraphConfig namedtuple positions: 2=CHUNK_SIZE, 3=FANOUT
         DataSource namedtuple positions:  2=WATERSHED (path), 4=CV_MIP
         """
-        if _cloudvolume is None:
+        if ts is None:
             return None
         graph_config = getattr(meta, "graph_config", None)
         data_source = getattr(meta, "data_source", None)
@@ -77,11 +78,12 @@ class RootExtension:
             return None
         chunk_size = np.array(gc_args[2], dtype=int)
         fanout = int(gc_args[3])
-        watershed = ds_args[2]
+        # Base must not end in '/'; the '/info' key's leading slash is the separator.
+        watershed = ds_args[2].rstrip("/")
         cv_mip = ds_args[4] if len(ds_args) > 4 else 0
-        cv = _cloudvolume.CloudVolume(watershed, mip=cv_mip)
-        bounds = np.array(cv.bounds.to_list()).reshape(2, 3)
-        voxel_counts = bounds[1] - bounds[0]
+        kvs = ts.KvStore.open(watershed).result()
+        info = json.loads(kvs.read("/info").result().value)
+        voxel_counts = np.array(info["scales"][cv_mip]["size"])
         n_chunks = np.ceil(voxel_counts / chunk_size).astype(int)
         return int(np.ceil(np.log(np.max(n_chunks)) / np.log(fanout))) + 2
 

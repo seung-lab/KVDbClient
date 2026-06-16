@@ -1,11 +1,11 @@
 [build-system]
-requires = ["setuptools>=64"]
+requires = ["setuptools>=64", "setuptools_scm>=8"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "kvdbclient"
-version = "0.7.0"
-requires-python = ">=3.11"
+dynamic = ["version"]
+requires-python = ">=3.13"
 dependencies = [
     "numpy",
     "zstandard>=0.23.0",
@@ -16,10 +16,13 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-extensions = ["cloud-volume"]
+extensions = ["tensorstore"]
 
 [tool.setuptools.packages.find]
 include = ["kvdbclient*"]
+
+[tool.setuptools_scm]
+fallback_version = "0.7.0"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
