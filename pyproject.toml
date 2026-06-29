@@ -19,7 +19,7 @@ dependencies = [
 extensions = ["tensorstore"]
 
 [tool.setuptools.packages.find]
-include = ["kvdbclient*"]
+include = ["kvdbclient*", "kvdbclient_testing*"]
 
 [tool.setuptools_scm]
 fallback_version = "0.7.0"

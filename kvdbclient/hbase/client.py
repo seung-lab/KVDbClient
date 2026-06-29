@@ -13,6 +13,7 @@ from requests.adapters import HTTPAdapter
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
 from . import HBaseConfig
+from . import get_client_info
 from . import utils as hbase_utils
 from ..base import Cell, ClientWithIDGen, ColumnFamilyConfig, DEFAULT_COLUMN_FAMILIES, OperationLogger
 from .. import attributes
@@ -81,6 +82,13 @@ class HBaseMutation:
 
 
 class Client(ClientWithIDGen, OperationLogger):
+    backend_name = "hbase"
+    config_class = HBaseConfig
+
+    @staticmethod
+    def default_client_info():
+        return get_client_info()
+
     def __init__(
         self,
         table_id: str,

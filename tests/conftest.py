@@ -1,8 +1,3 @@
-import os
-import signal
-import socket
-import subprocess
-import time
 import uuid
 from datetime import timedelta
 
@@ -12,28 +7,12 @@ from kvdbclient.bigtable import BigTableConfig
 from kvdbclient.bigtable.client import Client
 from kvdbclient.hbase import HBaseConfig
 from kvdbclient.hbase.client import Client as HBaseClient
-from hbase_mock_server import start_hbase_mock_server
+from kvdbclient_testing.bigtable.harness import bigtable_emulator as _bigtable_emulator
+from kvdbclient_testing.hbase.mock_server import start_hbase_mock_server
 
 
 EMULATOR_PROJECT = "test-project"
 EMULATOR_INSTANCE = "test-instance"
-
-
-def _find_free_port():
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("", 0))
-        return s.getsockname()[1]
-
-
-def _wait_for_port(host, port, timeout=30.0):
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        try:
-            with socket.create_connection((host, port), timeout=1):
-                return
-        except OSError:
-            time.sleep(0.2)
-    raise RuntimeError(f"Emulator on {host}:{port} not ready within {timeout}s")
 
 
 # ── BigTable fixtures ────────────────────────────────────────────────────
@@ -41,31 +20,9 @@ def _wait_for_port(host, port, timeout=30.0):
 
 @pytest.fixture(scope="session")
 def bigtable_emulator():
-    """Start the BigTable emulator or use one already running (CI)."""
-    existing = os.environ.get("BIGTABLE_EMULATOR_HOST")
-    if existing:
-        host, port = existing.rsplit(":", 1)
-        _wait_for_port(host or "localhost", int(port))
-        yield existing
-        return
-
-    port = _find_free_port()
-    host_port = f"localhost:{port}"
-    proc = subprocess.Popen(
-        [
-            "gcloud", "beta", "emulators", "bigtable", "start",
-            f"--host-port={host_port}",
-        ],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
-    os.environ["BIGTABLE_EMULATOR_HOST"] = host_port
-    _wait_for_port("localhost", port)
-    yield host_port
-
-    os.kill(proc.pid, signal.SIGTERM)
-    proc.wait(timeout=10)
-    os.environ.pop("BIGTABLE_EMULATOR_HOST", None)
+    """Start the BigTable emulator or reuse one already running (CI)."""
+    with _bigtable_emulator() as host_port:
+        yield host_port
 
 
 @pytest.fixture(scope="session")

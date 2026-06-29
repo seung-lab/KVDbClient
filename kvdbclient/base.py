@@ -4,6 +4,7 @@ import typing
 import logging
 from abc import ABC
 from abc import abstractmethod
+from inspect import isabstract
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -19,6 +20,7 @@ from .serializers import serialize_uint64
 from .serializers import serialize_uint64_batch
 from .serializers import deserialize_uint64
 from .extensions import RootExtension
+from .registry import register_backend
 
 
 @dataclass(frozen=True)
@@ -68,6 +70,26 @@ class SimpleClient(ABC):
     Abstract class for interacting with backend data store.
     Eg., BigTableClient for using big table as storage, HBaseClient for Apache HBase.
     """
+
+    backend_name = None
+    config_class = None
+    default_client_info = None
+
+    def __init_subclass__(cls, **kwargs):
+        """Self-register every concrete backend; an incomplete one fails at import."""
+        super().__init_subclass__(**kwargs)
+        if isabstract(cls):
+            return
+        missing = [
+            name
+            for name in ("backend_name", "config_class", "default_client_info")
+            if getattr(cls, name, None) is None
+        ]
+        if missing:
+            raise TypeError(
+                f"backend client {cls.__name__} must define {', '.join(missing)} to register"
+            )
+        register_backend(cls)
 
     def _init_common(self, logger_name, table_meta, lock_expiry, max_row_key_count):
         self.logger = logging.getLogger(logger_name)

@@ -28,6 +28,7 @@ from google.api_core.exceptions import ServiceUnavailable
 
 from . import utils
 from . import BigTableConfig
+from . import get_client_info
 from ..base import Cell
 from ..base import ClientWithIDGen
 from ..base import ColumnFamilyConfig
@@ -81,6 +82,13 @@ class _ReadAllRowsResult:
 
 
 class Client(ClientWithIDGen, OperationLogger):
+    backend_name = "bigtable"
+    config_class = BigTableConfig
+
+    @staticmethod
+    def default_client_info():
+        return get_client_info(admin=True, read_only=False)
+
     def __init__(
         self,
         table_id: str,
