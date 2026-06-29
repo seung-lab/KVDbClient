@@ -1,7 +1,7 @@
 """In-process mock HBase REST (Stargate) server for testing.
 
 Implements the subset of the HBase REST API used by
-``pychunkedgraph.graph.client.hbase.client.Client``.
+``kvdbclient.hbase.client.Client``.
 Runs in a daemon thread on a random port using stdlib ``http.server``.
 """
 
@@ -14,10 +14,10 @@ import uuid
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
 
-
 # ---------------------------------------------------------------------------
 # Data structures
 # ---------------------------------------------------------------------------
+
 
 class ScannerState:
     __slots__ = ("rows", "position", "batch_size")
@@ -44,6 +44,7 @@ class HBaseMockData:
 # Helpers
 # ---------------------------------------------------------------------------
 
+
 def _b64enc(data: bytes) -> str:
     return base64.b64encode(data).decode("ascii")
 
@@ -69,6 +70,7 @@ def _insert_cell(cell_list: list, value: bytes, ts_ms: int):
 # ---------------------------------------------------------------------------
 # Request handler
 # ---------------------------------------------------------------------------
+
 
 def _make_handler_class(data: HBaseMockData):
     """Create a handler class bound to the given shared data."""
@@ -109,7 +111,9 @@ def _make_handler_class(data: HBaseMockData):
             self.send_header("Content-Length", "0")
             self.end_headers()
 
-        def _send_bytes(self, raw: bytes, code=200, content_type="application/octet-stream"):
+        def _send_bytes(
+            self, raw: bytes, code=200, content_type="application/octet-stream"
+        ):
             self.send_response(code)
             self.send_header("Content-Type", content_type)
             self.send_header("Content-Length", str(len(raw)))
@@ -142,7 +146,7 @@ def _make_handler_class(data: HBaseMockData):
                     if sc.position >= len(sc.rows):
                         return self._send_empty(204)
                     end = sc.position + sc.batch_size
-                    batch = sc.rows[sc.position:end]
+                    batch = sc.rows[sc.position : end]
                     sc.position = end
                 return self._send_json(self._rows_to_cellset(batch))
 
@@ -158,7 +162,9 @@ def _make_handler_class(data: HBaseMockData):
                 if tbl is None or row_key not in tbl:
                     return self._send_empty(404)
                 row_data = tbl[row_key]
-                cells = self._filter_cells(row_data, col_specs, ts_from, ts_to, max_versions)
+                cells = self._filter_cells(
+                    row_data, col_specs, ts_from, ts_to, max_versions
+                )
                 if not cells:
                     return self._send_empty(404)
             return self._send_json(self._rows_to_cellset([(row_key, cells)]))
@@ -430,15 +436,19 @@ def _make_handler_class(data: HBaseMockData):
                 out_cells = []
                 for col, cell_list in cells.items():
                     for val, ts in cell_list:
-                        out_cells.append({
-                            "column": _b64enc(col.encode("utf-8")),
-                            "$": _b64enc(val),
-                            "timestamp": ts,
-                        })
-                out_rows.append({
-                    "key": _b64enc(rk),
-                    "Cell": out_cells,
-                })
+                        out_cells.append(
+                            {
+                                "column": _b64enc(col.encode("utf-8")),
+                                "$": _b64enc(val),
+                                "timestamp": ts,
+                            }
+                        )
+                out_rows.append(
+                    {
+                        "key": _b64enc(rk),
+                        "Cell": out_cells,
+                    }
+                )
             return {"Row": out_rows}
 
     return Handler
@@ -447,6 +457,7 @@ def _make_handler_class(data: HBaseMockData):
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
+
 
 def start_hbase_mock_server(host="127.0.0.1", port=0):
     """Start mock HBase REST server in a daemon thread.

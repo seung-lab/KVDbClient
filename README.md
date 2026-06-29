@@ -34,7 +34,7 @@ config = BigTableConfig(PROJECT="my-project", INSTANCE="my-instance", ADMIN=True
 client = get_client_class("bigtable")("my_table", config)
 ```
 
-The backend is selected by passing `"bigtable"` or `"hbase"` to `get_client_class()`. Alternatively, `get_default_client_info()` reads configuration from environment variables automatically.
+The backend is selected by passing a name to `get_client_class()` (its config class via `get_config_class()`); `available_backends()` lists the registered names. Alternatively, `get_default_client_info()` reads configuration from environment variables automatically.
 
 ## Backends
 
@@ -44,11 +44,26 @@ The backend is selected by passing `"bigtable"` or `"hbase"` to `get_client_clas
 
 Set `PCG_BACKEND_TYPE` to `bigtable` or `hbase` to control which backend `get_default_client_info()` uses.
 
+### Adding a backend
+
+A backend is a concrete `SimpleClient` subclass that sets `backend_name`, `config_class`, and
+`default_client_info()`; defining the class self-registers it, and a concrete client missing any of
+these fails at import. Its test double lives in the sibling `kvdbclient_testing` package: a
+`BackendHarness` subclass exposed as `harness` at `kvdbclient_testing/<name>/harness.py`.
+`kvdbclient_testing.backends()` discovers it, and a registered backend with no harness is an error.
+Downstream test suites then run against every discovered backend with no change on their side.
+
 ## Testing
 
 ```bash
 pytest
 ```
+
+Test doubles (the bigtable emulator bootstrap and the in-process HBase REST mock) live in the
+`kvdbclient_testing` package — a sibling of `kvdbclient/` that ships in the same wheel but is never
+imported by the runtime library. `kvdbclient_testing.backends()` yields a harness for each available
+backend — start a local instance, hand out its client config, tear down — the discovery API that this
+suite and downstream suites parametrize over.
 
 ## Release
 

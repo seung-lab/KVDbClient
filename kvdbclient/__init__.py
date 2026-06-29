@@ -26,11 +26,10 @@ warnings.filterwarnings("ignore", message="urllib3", module="requests")
 
 from .base import ColumnFamilyConfig, DEFAULT_COLUMN_FAMILIES
 from .bigtable import BigTableConfig
-from .bigtable import get_client_info as get_bigtable_client_info
 from .bigtable.client import Client as BigTableClient
 from .hbase import HBaseConfig
-from .hbase import get_client_info as get_hbase_client_info
 from .hbase.client import Client as HBaseClient
+from .registry import available_backends, resolve_client
 
 ClientType = Union[BigTableClient, HBaseClient]
 
@@ -46,25 +45,17 @@ BackendClientInfo = namedtuple(
 
 def get_client_class(backend_type: str = "bigtable"):
     """Return the client class for the given backend type."""
-    backend_type = (backend_type or "bigtable").lower()
-    if backend_type == "bigtable":
-        return BigTableClient
-    elif backend_type == "hbase":
-        return HBaseClient
-    else:
-        raise ValueError(f"Unknown backend type: {backend_type}")
+    return resolve_client(backend_type)
+
+
+def get_config_class(backend_type: str = "bigtable"):
+    """Return the config class for the given backend type."""
+    return resolve_client(backend_type).config_class
 
 
 def get_default_client_info():
-    """
-    Load client from env variables.
-    """
-    backend_type = environ.get("PCG_BACKEND_TYPE", "bigtable").lower()
-    if backend_type == "hbase":
-        return BackendClientInfo(
-            TYPE="hbase", CONFIG=get_hbase_client_info()
-        )
-
-    return BackendClientInfo(
-        TYPE="bigtable", CONFIG=get_bigtable_client_info(admin=True, read_only=False)
-    )
+    """Load client info for the env-selected backend."""
+    name = environ.get("PCG_BACKEND_TYPE", "bigtable").lower()
+    if name not in available_backends():
+        name = "bigtable"
+    return BackendClientInfo(TYPE=name, CONFIG=resolve_client(name).default_client_info())
