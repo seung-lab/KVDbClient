@@ -4,7 +4,6 @@ import typing
 import logging
 from abc import ABC
 from abc import abstractmethod
-from inspect import isabstract
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -76,13 +75,13 @@ class SimpleClient(ABC):
     default_client_info = None
 
     def __init_subclass__(cls, **kwargs):
-        """Self-register every concrete backend; an incomplete one fails at import."""
+        """Register a backend that declares its own ``backend_name``; an incomplete one fails."""
         super().__init_subclass__(**kwargs)
-        if isabstract(cls):
+        if "backend_name" not in cls.__dict__:
             return
         missing = [
             name
-            for name in ("backend_name", "config_class", "default_client_info")
+            for name in ("config_class", "default_client_info")
             if getattr(cls, name, None) is None
         ]
         if missing:
