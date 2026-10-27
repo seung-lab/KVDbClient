@@ -36,6 +36,12 @@ client = get_client_class("bigtable")("my_table", config)
 
 The backend is selected by passing a name to `get_client_class()` (its config class via `get_config_class()`); `available_backends()` lists the registered names. Alternatively, `get_default_client_info()` reads configuration from environment variables automatically.
 
+### Root extension
+
+`client.root_ext` answers root queries (`get_root(s)`, `get_parent(s)`, `is_latest_roots`) straight
+from a graph's table. It is read-only, for admin access that skips the latency of PyChunkedGraph's
+Flask frontend, and it mirrors PyChunkedGraph's rules. PyChunkedGraph itself must never call it.
+
 ## Backends
 
 **Google BigTable** — Uses the `google-cloud-bigtable` SDK. Configure with `BigTableConfig` or set `BIGTABLE_PROJECT` and `BIGTABLE_INSTANCE` environment variables.
