@@ -20,6 +20,10 @@ class RootExtension:
     Mirrors the root-traversal methods from PyChunkedGraph.
     Access via client.root_ext (lazily initialised on first access).
 
+    Read-only, for admin tools that read a graph's table directly to skip the
+    latency of PyChunkedGraph's Flask frontend. PyChunkedGraph itself must never
+    call it: PyChunkedGraph owns these rules, and this class only mirrors them.
+
     Layer is encoded in the top `layer_id_bits` bits of each uint64 node ID:
         layer = int(node_id) >> (64 - layer_id_bits)
 
@@ -195,17 +199,20 @@ class RootExtension:
         root_ids: typing.Sequence[np.uint64],
         time_stamp: typing.Optional[datetime] = None,
     ) -> np.ndarray:
+        """Whether each root existed and was not yet superseded before `time_stamp`.
+
+        Same rule as PyChunkedGraph's `ChunkedGraph.is_latest_roots`, which the REST API serves.
+        """
         time_stamp = get_valid_timestamp(time_stamp)
         root_ids = np.array(root_ids, dtype=basetypes.NODE_ID)
         rows = self._client.read_nodes(
             node_ids=root_ids,
-            properties=attributes.Hierarchy.NewParent,
+            properties=[attributes.Hierarchy.Child, attributes.Hierarchy.NewParent],
             end_time=time_stamp,
-            end_time_inclusive=True,
         )
-        superseded = (
-            np.array(list(rows.keys()), dtype=basetypes.NODE_ID)
-            if rows
-            else np.array([], dtype=basetypes.NODE_ID)
-        )
-        return ~np.isin(root_ids, superseded)
+        latest = [
+            node_id
+            for node_id, cells in rows.items()
+            if attributes.Hierarchy.NewParent not in cells
+        ]
+        return np.isin(root_ids, np.array(latest, dtype=basetypes.NODE_ID))
