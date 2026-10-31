@@ -37,7 +37,7 @@ from ..base import OperationLogger
 from .. import attributes
 from .. import exceptions
 from ..serializers import serialize_uint64
-from ..utils import get_valid_timestamp
+from ..utils import get_valid_timestamp, require_before
 
 
 def _datetime_to_micros(dt: datetime) -> int:
@@ -223,12 +223,15 @@ class Client(ClientWithIDGen, OperationLogger):
             )
         return RowMutationEntry(row_key, mutations)
 
-    def _write_rows(self, rows, slow_retry=True, block_size=10000):
+    def _write_rows(self, rows, slow_retry=True, block_size=10000, deadline=None):
         rows_list = list(rows)
         if not rows_list:
             return
 
         timeout = self._lock_expiry.total_seconds() if slow_retry else 30.0
+        if deadline is not None:
+            # Timing out at the deadline, a stalled caller cannot land rows later.
+            timeout = min(timeout, require_before(deadline))
         try:
             if len(rows_list) == 1:
                 entry = rows_list[0]

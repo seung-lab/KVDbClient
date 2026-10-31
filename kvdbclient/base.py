@@ -134,9 +134,15 @@ class SimpleClient(ABC):
         """
 
     def write(
-        self, rows, root_ids=None, operation_id=None, slow_retry=True, block_size=2000
+        self,
+        rows,
+        root_ids=None,
+        operation_id=None,
+        slow_retry=True,
+        block_size=2000,
+        deadline: typing.Optional[datetime] = None,
     ):
-        """Write a list of mutated rows in bulk."""
+        """Write a list of mutated rows in bulk, refused once `deadline` has passed."""
         if root_ids is not None and operation_id is not None:
             if isinstance(root_ids, int):
                 root_ids = [root_ids]
@@ -144,11 +150,13 @@ class SimpleClient(ABC):
                 raise exceptions.LockingError(
                     f"Root lock renewal failed: operation {operation_id}"
                 )
-        self._write_rows(rows, slow_retry=slow_retry, block_size=block_size)
+        self._write_rows(
+            rows, slow_retry=slow_retry, block_size=block_size, deadline=deadline
+        )
 
     @abstractmethod
-    def _write_rows(self, rows, slow_retry=True, block_size=2000):
-        """Backend-specific bulk write implementation."""
+    def _write_rows(self, rows, slow_retry=True, block_size=2000, deadline=None):
+        """Backend-specific bulk write; sends nothing once `deadline` has passed."""
 
     @abstractmethod
     def lock_root(self, node_id, operation_id):

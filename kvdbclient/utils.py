@@ -4,6 +4,16 @@ import datetime
 
 import pytz
 
+from . import exceptions
+
+
+def require_before(deadline: datetime.datetime) -> float:
+    """Seconds until `deadline`; raises `WriteDeadlineError` once none remain."""
+    left = (deadline - datetime.datetime.now(datetime.timezone.utc)).total_seconds()
+    if left <= 0:
+        raise exceptions.WriteDeadlineError(f"write deadline {deadline} has passed")
+    return left
+
 
 def get_max_time():
     """Returns the (almost) max time in datetime.datetime."""
