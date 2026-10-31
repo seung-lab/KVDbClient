@@ -22,6 +22,23 @@ SOURCE_WORKERS = 8
 # A table's identity rows are its own: a fork never reads its source's meta or version.
 OWN_ROWS = frozenset({attributes.TableMeta.key, attributes.TableVersion.key})
 
+# The data-table calls an attached fork may make; every other call writes.
+READS = frozenset({"read_rows", "read_row", "read_rows_stream"})
+
+
+class _ReadOnlyTable:
+    """A fork's data table, refusing every write until fork edits are supported."""
+
+    def __init__(self, table, table_id: str):
+        self._table, self._table_id = table, table_id
+
+    def __getattr__(self, name):
+        if name not in READS:
+            raise exceptions.ForkTableError(
+                f"fork {self._table_id} is read-only: fork edits are not supported yet"
+            )
+        return getattr(self._table, name)
+
 
 def _merged(own, upstream):
     """Two reads' rows, columns or cells, newest first; a fork cell wins a tie."""
@@ -77,6 +94,7 @@ class ForkClient(Client):
         if len(marker.chain) > 1:
             self._source.attach(replace(marker, chain=marker.chain[1:]))
         self._pool = ThreadPoolExecutor(max_workers=SOURCE_WORKERS)
+        self._table = _ReadOnlyTable(self._table, self._table_id)
 
     def close(self):
         if self._source is not None:
@@ -210,8 +228,9 @@ def create_fork_table(
     column_families=None,
     lock_expiry: timedelta = timedelta(minutes=3),
 ) -> ForkClient:
-    """Create a fork's table; its meta and marker land in one mutation."""
+    """Create a fork's table, meta and marker in one mutation, then attach read-only."""
     client = ForkClient(table_id, config, lock_expiry=lock_expiry)
-    client.attach(marker)
+    client.marker = marker
     client.create_table(meta, version, column_families)
+    client.attach(marker)
     return client

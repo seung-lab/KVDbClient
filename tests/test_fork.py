@@ -1,4 +1,4 @@
-"""A fork reads its own table merged with its source's, capped at `TF`."""
+"""A fork reads its table merged with its source's, capped at `TF`, and writes nothing."""
 
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -26,6 +26,11 @@ def _name():
 
 def _put(client, key, value, at):
     client.write([client.mutate_row(key, {PARENT: np.uint64(value)}, time_stamp=at)])
+
+
+def _plain(fork):
+    """A plain client on a fork's table, standing in for the edits forks refuse."""
+    return Client(table_id=fork._table_id, config=fork._config)
 
 
 def _values(cells):
@@ -65,14 +70,14 @@ def test_a_fork_reads_its_source_up_to_tf_only(fork):
     assert fork._read_byte_row(OTHER, columns=PARENT) == []
 
 
-def test_a_fork_write_merges_newest_first_and_wins_a_tie(fork):
-    _put(fork, ROW, 5, T3)
-    _put(fork, ROW, 9, T1)
+def test_a_fork_row_merges_newest_first_and_wins_a_tie(fork):
+    _put(_plain(fork), ROW, 5, T3)
+    _put(_plain(fork), ROW, 9, T1)
     assert _values(fork._read_byte_row(ROW, columns=PARENT)) == [5, 9]
 
 
 def test_ranges_and_row_keys_merge_alike(fork):
-    _put(fork, OTHER, 4, T3)
+    _put(_plain(fork), OTHER, 4, T3)
     rows = fork._read_byte_rows(row_keys=[ROW, OTHER], columns=PARENT)
     ranged = fork._read_byte_rows(
         start_key=ROW, end_key=OTHER, end_key_inclusive=True, columns=PARENT
@@ -82,7 +87,7 @@ def test_ranges_and_row_keys_merge_alike(fork):
 
 
 def test_a_window_past_tf_reads_the_fork_alone(fork):
-    _put(fork, ROW, 5, T3)
+    _put(_plain(fork), ROW, 5, T3)
     assert _values(fork._read_byte_row(ROW, columns=PARENT, start_time=T2)) == [5]
 
 
@@ -117,10 +122,23 @@ def test_a_fork_reads_only_its_own_meta_and_version(source, bt_config):
     assert fork.read_table_meta() == {"fork": True}
 
 
-def test_a_meta_overwrite_keeps_the_marker(fork, bt_config):
-    fork.update_table_meta({"test": False}, overwrite=True)
-    opened = open_client(fork._table_id, config=bt_config)
-    assert opened.marker == fork.marker and opened.read_table_meta() == {"test": False}
+WRITES = {
+    "rows": lambda fork: _put(fork, ROW, 5, T3),
+    "root lock": lambda fork: fork.lock_root(np.uint64(1), np.uint64(2)),
+    "id counter": lambda fork: fork.create_node_ids(np.uint64(1), 1),
+    "operation id": lambda fork: fork.create_operation_id(),
+    "meta": lambda fork: fork.update_table_meta({"test": False}, overwrite=True),
+}
+
+
+@pytest.mark.parametrize("write", WRITES.values(), ids=WRITES.keys())
+def test_a_fork_refuses_every_write_and_keeps_reading(fork, bt_config, write):
+    with pytest.raises(ForkTableError, match="read-only"):
+        write(open_client(fork._table_id, config=bt_config))
+    assert _values(fork._read_byte_row(ROW, columns=PARENT)) == [1]
+    assert open_client(fork._table_id, config=bt_config).read_table_meta() == {
+        "test": True
+    }
 
 
 def test_a_fork_of_a_fork_reads_the_source_capped_at_the_earlier_tf(
@@ -131,7 +149,7 @@ def test_a_fork_of_a_fork_reads_the_source_capped_at_the_earlier_tf(
         _name(), marker, {"test": True}, "0.0.1", config=bt_config
     )
     assert _values(second._read_byte_row(ROW, columns=PARENT)) == [1]
-    _put(fork, ROW, 6, T2)
+    _put(_plain(fork), ROW, 6, T2)
     assert _values(second._read_byte_row(ROW, columns=PARENT)) == [6, 1]
     reopened = open_client(second._table_id, config=bt_config)
     assert _values(reopened._read_byte_row(ROW, columns=PARENT)) == [6, 1]
