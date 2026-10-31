@@ -74,6 +74,8 @@ class SimpleClient(ABC):
     backend_name = None
     config_class = None
     default_client_info = None
+    # A client reading only its own table refuses a fork's: its older rows live upstream.
+    opens_forks = False
 
     def __init_subclass__(cls, **kwargs):
         """Register a backend that declares its own ``backend_name``; an incomplete one fails."""
@@ -300,6 +302,10 @@ class SimpleClient(ABC):
 
     def read_table_meta(self):
         row = self._read_byte_row(attributes.TableMeta.key)
+        if attributes.TableMeta.Fork in row and not self.opens_forks:
+            raise exceptions.ForkTableError(
+                "this table is a fork; open it with kvdbclient.fork.client.open_client"
+            )
         try:
             self._table_meta = row[attributes.TableMeta.Meta][0].value
         except KeyError:

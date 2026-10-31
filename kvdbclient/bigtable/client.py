@@ -99,17 +99,21 @@ class Client(ClientWithIDGen, OperationLogger):
         config: BigTableConfig = BigTableConfig(),
         table_meta=None,
         lock_expiry: timedelta = timedelta(minutes=3),
+        data_client: typing.Optional[BigtableDataClient] = None,
     ):
         # Store config for lazy admin client creation
         self._config = config
         self._table_id = table_id
         self.__admin_table = None
 
-        # Data client (new — all read/write/lock operations)
-        data_kwargs = dict(project=config.PROJECT)
-        if config.CREDENTIALS:
-            data_kwargs["credentials"] = config.CREDENTIALS
-        self._data_client = BigtableDataClient(**data_kwargs)
+        # A data client passed in is shared and closed by whoever created it.
+        owns_data_client = data_client is None
+        if owns_data_client:
+            data_kwargs = dict(project=config.PROJECT)
+            if config.CREDENTIALS:
+                data_kwargs["credentials"] = config.CREDENTIALS
+            data_client = BigtableDataClient(**data_kwargs)
+        self._data_client = data_client
         self._table = self._data_client.get_table(
             config.INSTANCE,
             table_id,
@@ -135,11 +139,16 @@ class Client(ClientWithIDGen, OperationLogger):
             lock_expiry=lock_expiry,
             max_row_key_count=config.MAX_ROW_KEY_COUNT,
         )
-        self._finalizer = weakref.finalize(self, Client._shutdown, self._data_client)
-        atexit.register(self._finalizer)
+        self._finalizer = None
+        if owns_data_client:
+            self._finalizer = weakref.finalize(
+                self, Client._shutdown, self._data_client
+            )
+            atexit.register(self._finalizer)
 
     def close(self):
-        self._finalizer()
+        if self._finalizer is not None:
+            self._finalizer()
 
     @staticmethod
     def _shutdown(data_client):
