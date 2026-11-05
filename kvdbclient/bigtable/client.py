@@ -56,7 +56,11 @@ class _CompatibleRow:
     def __init__(self, row):
         families = defaultdict(lambda: defaultdict(list))
         for cell in row.cells:
-            qual = cell.qualifier if isinstance(cell.qualifier, bytes) else cell.qualifier.encode()
+            qual = (
+                cell.qualifier
+                if isinstance(cell.qualifier, bytes)
+                else cell.qualifier.encode()
+            )
             families[cell.family][qual].append(
                 Cell(value=cell.value, timestamp=cell.timestamp_micros)
             )
@@ -114,7 +118,8 @@ class Client(ClientWithIDGen, OperationLogger):
             default_read_rows_attempt_timeout=20.0,
             # Mutate rows (batch)
             default_mutate_rows_retryable_errors=(
-                DeadlineExceeded, ServiceUnavailable,
+                DeadlineExceeded,
+                ServiceUnavailable,
             ),
             default_mutate_rows_operation_timeout=lock_expiry.total_seconds(),
             default_mutate_rows_attempt_timeout=60.0,
@@ -130,9 +135,7 @@ class Client(ClientWithIDGen, OperationLogger):
             lock_expiry=lock_expiry,
             max_row_key_count=config.MAX_ROW_KEY_COUNT,
         )
-        self._finalizer = weakref.finalize(
-            self, Client._shutdown, self._data_client
-        )
+        self._finalizer = weakref.finalize(self, Client._shutdown, self._data_client)
         atexit.register(self._finalizer)
 
     def close(self):
@@ -221,7 +224,9 @@ class Client(ClientWithIDGen, OperationLogger):
             if len(rows_list) == 1:
                 entry = rows_list[0]
                 self._table.mutate_row(
-                    entry.row_key, list(entry.mutations), operation_timeout=timeout,
+                    entry.row_key,
+                    list(entry.mutations),
+                    operation_timeout=timeout,
                 )
             else:
                 with self._table.mutations_batcher(
@@ -231,9 +236,7 @@ class Client(ClientWithIDGen, OperationLogger):
                     for entry in rows_list:
                         batcher.append(entry)
         except MutationsExceptionGroup as exc:
-            raise exceptions.KVDBClientError(
-                f"Bulk write failed: {exc}"
-            ) from exc
+            raise exceptions.KVDBClientError(f"Bulk write failed: {exc}") from exc
 
     def _set_lock_mutation(self, lock_column, operation_id: np.uint64) -> SetCell:
         return SetCell(
@@ -267,7 +270,9 @@ class Client(ClientWithIDGen, OperationLogger):
             self.logger.debug(f"Locked operation ids: {l_operation_ids}")
         return lock_acquired
 
-    def lock_root_indefinitely(self, root_id: np.uint64, operation_id: np.uint64) -> bool:
+    def lock_root_indefinitely(
+        self, root_id: np.uint64, operation_id: np.uint64
+    ) -> bool:
         lock_column = attributes.Concurrency.IndefiniteLock
         filter_ = utils.get_indefinite_root_lock_filter(lock_column)
         lock_acquired = not self._table.check_and_mutate_row(
@@ -294,11 +299,15 @@ class Client(ClientWithIDGen, OperationLogger):
             operation_timeout=30.0,
         )
 
-    def unlock_indefinitely_locked_root(self, root_id: np.uint64, operation_id: np.uint64):
+    def unlock_indefinitely_locked_root(
+        self, root_id: np.uint64, operation_id: np.uint64
+    ):
         lock_column = attributes.Concurrency.IndefiniteLock
         return self._table.check_and_mutate_row(
             serialize_uint64(root_id),
-            predicate=utils.get_indefinite_unlock_root_filter(lock_column, operation_id),
+            predicate=utils.get_indefinite_unlock_root_filter(
+                lock_column, operation_id
+            ),
             true_case_mutations=self._delete_lock_mutation(lock_column),
             operation_timeout=30.0,
         )
@@ -392,7 +401,9 @@ class Client(ClientWithIDGen, OperationLogger):
         lock_column = attributes.Concurrency.IndefiniteLock
         return self._table.check_and_mutate_row(
             row_key,
-            predicate=utils.get_indefinite_unlock_root_filter(lock_column, operation_id),
+            predicate=utils.get_indefinite_unlock_root_filter(
+                lock_column, operation_id
+            ),
             true_case_mutations=self._delete_lock_mutation(lock_column),
             operation_timeout=30.0,
         )
@@ -400,14 +411,18 @@ class Client(ClientWithIDGen, OperationLogger):
     def renew_lock_by_row_key(self, row_key: bytes, operation_id: np.uint64) -> bool:
         lock_column = attributes.Concurrency.Lock
         filter_ = utils.get_row_key_renew_lock_filter(lock_column, operation_id)
-        return bool(self._table.check_and_mutate_row(
-            row_key,
-            predicate=filter_,
-            true_case_mutations=self._set_lock_mutation(lock_column, operation_id),
-            operation_timeout=30.0,
-        ))
+        return bool(
+            self._table.check_and_mutate_row(
+                row_key,
+                predicate=filter_,
+                true_case_mutations=self._set_lock_mutation(lock_column, operation_id),
+                operation_timeout=30.0,
+            )
+        )
 
-    def get_compatible_timestamp(self, time_stamp: datetime, round_up: bool = False) -> datetime:
+    def get_compatible_timestamp(
+        self, time_stamp: datetime, round_up: bool = False
+    ) -> datetime:
         return utils.get_google_compatible_time_stamp(time_stamp, round_up=round_up)
 
     def _get_ids_range(self, key: bytes, size: int) -> typing.Tuple:
@@ -445,12 +460,14 @@ class Client(ClientWithIDGen, OperationLogger):
         if row_keys is not None:
             pass
         elif start_key is not None and end_key is not None:
-            row_ranges = [RowRange(
-                start_key=start_key,
-                end_key=end_key,
-                start_is_inclusive=True,
-                end_is_inclusive=end_key_inclusive,
-            )]
+            row_ranges = [
+                RowRange(
+                    start_key=start_key,
+                    end_key=end_key,
+                    start_is_inclusive=True,
+                    end_is_inclusive=end_key_inclusive,
+                )
+            ]
         else:
             raise exceptions.PreconditionError(
                 "Need to either provide a valid set of rows, or"
@@ -477,7 +494,14 @@ class Client(ClientWithIDGen, OperationLogger):
                 rows[row_key] = column_dict.get(columns, [])
         return rows
 
-    def _read_byte_row(self, row_key, columns=None, start_time=None, end_time=None, end_time_inclusive=False):
+    def _read_byte_row(
+        self,
+        row_key,
+        columns=None,
+        start_time=None,
+        end_time=None,
+        end_time_inclusive=False,
+    ):
         filter_ = utils.get_time_range_and_column_filter(
             columns=columns,
             start_time=start_time,
@@ -510,7 +534,7 @@ class Client(ClientWithIDGen, OperationLogger):
             combined = {}
             for i in range(0, len(row_keys), self._max_row_key_count):
                 chunk_query = ReadRowsQuery(
-                    row_keys=row_keys[i:i + self._max_row_key_count],
+                    row_keys=row_keys[i : i + self._max_row_key_count],
                     row_filter=row_filter,
                 )
                 for row in self._table.read_rows(chunk_query):
@@ -532,14 +556,16 @@ class Client(ClientWithIDGen, OperationLogger):
             for ts in timestamps:
                 start_us = _datetime_to_micros(ts)
                 end_us = start_us + 1000  # 1ms (bigtable granularity)
-                row_mutations.append(DeleteRangeFromColumn(
-                    family=column.family_id,
-                    qualifier=column.key,
-                    start_timestamp_micros=start_us,
-                    end_timestamp_micros=end_us,
-                ))
+                row_mutations.append(
+                    DeleteRangeFromColumn(
+                        family=column.family_id,
+                        qualifier=column.key,
+                        start_timestamp_micros=start_us,
+                        end_timestamp_micros=end_us,
+                    )
+                )
             entries.append(RowMutationEntry(row_key, row_mutations))
-        for key in (row_keys_to_delete or []):
+        for key in row_keys_to_delete or []:
             entries.append(RowMutationEntry(key, DeleteAllFromRow()))
         if entries:
             self._table.bulk_mutate_rows(entries)

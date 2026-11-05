@@ -10,7 +10,6 @@ from kvdbclient.hbase.client import Client as HBaseClient
 from kvdbclient_testing.bigtable.harness import bigtable_emulator as _bigtable_emulator
 from kvdbclient_testing.hbase.mock_server import start_hbase_mock_server
 
-
 EMULATOR_PROJECT = "test-project"
 EMULATOR_INSTANCE = "test-instance"
 
@@ -103,7 +102,9 @@ def hbase_client_no_table(hbase_config):
 @pytest.fixture()
 def hbase_client_short_expiry(hbase_config):
     table_id = f"test_{uuid.uuid4().hex[:12]}"
-    client = HBaseClient(table_id=table_id, config=hbase_config, lock_expiry=timedelta(seconds=1))
+    client = HBaseClient(
+        table_id=table_id, config=hbase_config, lock_expiry=timedelta(seconds=1)
+    )
     client.create_table(meta={"test": True}, version="0.0.1")
     yield client
 
@@ -111,6 +112,8 @@ def hbase_client_short_expiry(hbase_config):
 @pytest.fixture()
 def bt_client_short_expiry(bt_config):
     table_id = f"test_{uuid.uuid4().hex[:12]}"
-    client = Client(table_id=table_id, config=bt_config, lock_expiry=timedelta(seconds=1))
+    client = Client(
+        table_id=table_id, config=bt_config, lock_expiry=timedelta(seconds=1)
+    )
     client.create_table(meta={"test": True}, version="0.0.1")
     yield client

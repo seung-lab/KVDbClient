@@ -13,7 +13,6 @@ from kvdbclient.serializers import serialize_uint64
 
 from helpers import write_node
 
-
 # ── Table Setup ──────────────────────────────────────────────────────────
 
 
@@ -31,6 +30,7 @@ class TestCreateTable:
 
     def test_custom_column_families(self, bt_client_no_table):
         from kvdbclient.base import ColumnFamilyConfig
+
         families = [
             ColumnFamilyConfig("0"),
             ColumnFamilyConfig("1", max_versions=3),
@@ -48,6 +48,7 @@ class TestCreateColumnFamily:
 
     def test_create_with_config(self, bt_client):
         from kvdbclient.base import ColumnFamilyConfig
+
         bt_client.create_column_family(ColumnFamilyConfig("6", max_versions=2))
 
 
@@ -85,7 +86,9 @@ class TestWriteRead:
     def test_single_row(self, bt_client):
         arr = np.array([10, 20, 30], dtype=basetypes.NODE_ID)
         write_node(bt_client, 100, {attributes.Hierarchy.Child: arr})
-        data = bt_client.read_node(np.uint64(100), properties=attributes.Hierarchy.Child)
+        data = bt_client.read_node(
+            np.uint64(100), properties=attributes.Hierarchy.Child
+        )
         np.testing.assert_array_equal(data[0].value, arr)
 
     def test_bulk_write(self, bt_client):
@@ -104,7 +107,9 @@ class TestWriteRead:
             data = bt_client.read_node(
                 np.uint64(200 + i), properties=attributes.Hierarchy.Child
             )
-            np.testing.assert_array_equal(data[0].value, np.array([i], dtype=basetypes.NODE_ID))
+            np.testing.assert_array_equal(
+                data[0].value, np.array([i], dtype=basetypes.NODE_ID)
+            )
 
     def test_empty_write_noop(self, bt_client):
         bt_client.write([])
@@ -131,7 +136,9 @@ class TestWriteRead:
         )
         bt_client.write([entry], root_ids=[root_id], operation_id=op_id)
 
-        data = bt_client.read_node(np.uint64(601), properties=attributes.Hierarchy.Child)
+        data = bt_client.read_node(
+            np.uint64(601), properties=attributes.Hierarchy.Child
+        )
         assert len(data) > 0
 
 
@@ -139,16 +146,22 @@ class TestReadNode:
     def test_single_property(self, bt_client):
         arr = np.array([10, 20], dtype=basetypes.NODE_ID)
         write_node(bt_client, 100, {attributes.Hierarchy.Child: arr})
-        data = bt_client.read_node(np.uint64(100), properties=attributes.Hierarchy.Child)
+        data = bt_client.read_node(
+            np.uint64(100), properties=attributes.Hierarchy.Child
+        )
         np.testing.assert_array_equal(data[0].value, arr)
 
     def test_multiple_properties(self, bt_client):
         child_arr = np.array([10], dtype=basetypes.NODE_ID)
         parent_val = np.uint64(42)
-        write_node(bt_client, 100, {
-            attributes.Hierarchy.Child: child_arr,
-            attributes.Hierarchy.Parent: parent_val,
-        })
+        write_node(
+            bt_client,
+            100,
+            {
+                attributes.Hierarchy.Child: child_arr,
+                attributes.Hierarchy.Parent: parent_val,
+            },
+        )
         data = bt_client.read_node(
             np.uint64(100),
             properties=[attributes.Hierarchy.Child, attributes.Hierarchy.Parent],
@@ -157,10 +170,14 @@ class TestReadNode:
         assert attributes.Hierarchy.Parent in data
 
     def test_all_properties(self, bt_client):
-        write_node(bt_client, 100, {
-            attributes.Hierarchy.Child: np.array([10], dtype=basetypes.NODE_ID),
-            attributes.Hierarchy.Parent: np.uint64(42),
-        })
+        write_node(
+            bt_client,
+            100,
+            {
+                attributes.Hierarchy.Child: np.array([10], dtype=basetypes.NODE_ID),
+                attributes.Hierarchy.Parent: np.uint64(42),
+            },
+        )
         data = bt_client.read_node(np.uint64(100))
         assert attributes.Hierarchy.Child in data
         assert attributes.Hierarchy.Parent in data
@@ -173,9 +190,15 @@ class TestReadNode:
 class TestReadNodes:
     def test_by_ids(self, bt_client):
         for nid in [100, 200, 300]:
-            write_node(bt_client, nid, {
-                attributes.Hierarchy.Child: np.array([nid], dtype=basetypes.NODE_ID),
-            })
+            write_node(
+                bt_client,
+                nid,
+                {
+                    attributes.Hierarchy.Child: np.array(
+                        [nid], dtype=basetypes.NODE_ID
+                    ),
+                },
+            )
         data = bt_client.read_nodes(
             node_ids=[np.uint64(100), np.uint64(200), np.uint64(300)],
             properties=attributes.Hierarchy.Child,
@@ -184,9 +207,15 @@ class TestReadNodes:
 
     def test_by_range(self, bt_client):
         for nid in [100, 200, 300]:
-            write_node(bt_client, nid, {
-                attributes.Hierarchy.Child: np.array([nid], dtype=basetypes.NODE_ID),
-            })
+            write_node(
+                bt_client,
+                nid,
+                {
+                    attributes.Hierarchy.Child: np.array(
+                        [nid], dtype=basetypes.NODE_ID
+                    ),
+                },
+            )
         data = bt_client.read_nodes(
             start_id=np.uint64(100),
             end_id=np.uint64(301),
@@ -199,9 +228,13 @@ class TestReadNodes:
             bt_client.read_nodes(properties=attributes.Hierarchy.Child)
 
     def test_attr_keys_false(self, bt_client):
-        write_node(bt_client, 100, {
-            attributes.Hierarchy.Child: np.array([10], dtype=basetypes.NODE_ID),
-        })
+        write_node(
+            bt_client,
+            100,
+            {
+                attributes.Hierarchy.Child: np.array([10], dtype=basetypes.NODE_ID),
+            },
+        )
         data = bt_client.read_nodes(
             node_ids=[np.uint64(100)],
             properties=[attributes.Hierarchy.Child],
@@ -219,9 +252,15 @@ class TestReadAllRows:
 
     def test_returns_written_rows(self, bt_client):
         for nid in [100, 200, 300]:
-            write_node(bt_client, nid, {
-                attributes.Hierarchy.Child: np.array([nid], dtype=basetypes.NODE_ID),
-            })
+            write_node(
+                bt_client,
+                nid,
+                {
+                    attributes.Hierarchy.Child: np.array(
+                        [nid], dtype=basetypes.NODE_ID
+                    ),
+                },
+            )
         result = bt_client.read_all_rows()
         assert len(result.rows) >= 5  # 3 nodes + meta + version
 
@@ -231,9 +270,13 @@ class TestReadAllRows:
 
 class TestDelete:
     def test_delete_row(self, bt_client):
-        row_key = write_node(bt_client, 100, {
-            attributes.Hierarchy.Child: np.array([10], dtype=basetypes.NODE_ID),
-        })
+        row_key = write_node(
+            bt_client,
+            100,
+            {
+                attributes.Hierarchy.Child: np.array([10], dtype=basetypes.NODE_ID),
+            },
+        )
         data = bt_client.read_node(np.uint64(100))
         assert len(data) > 0
 
@@ -245,12 +288,20 @@ class TestDelete:
         bt_client.delete_row(b"nonexistent")
 
     def test_delete_cells_with_row_keys(self, bt_client):
-        key1 = write_node(bt_client, 100, {
-            attributes.Hierarchy.Child: np.array([10], dtype=basetypes.NODE_ID),
-        })
-        key2 = write_node(bt_client, 200, {
-            attributes.Hierarchy.Child: np.array([20], dtype=basetypes.NODE_ID),
-        })
+        key1 = write_node(
+            bt_client,
+            100,
+            {
+                attributes.Hierarchy.Child: np.array([10], dtype=basetypes.NODE_ID),
+            },
+        )
+        key2 = write_node(
+            bt_client,
+            200,
+            {
+                attributes.Hierarchy.Child: np.array([20], dtype=basetypes.NODE_ID),
+            },
+        )
         bt_client.delete_cells([], row_keys_to_delete=[key1])
 
         assert bt_client.read_node(np.uint64(100)) == {}
@@ -418,7 +469,10 @@ class TestRenewLocks:
     def test_one_fails(self, bt_client):
         bt_client.lock_root(np.uint64(100), np.uint64(1))
         bt_client.lock_root(np.uint64(200), np.uint64(2))
-        assert bt_client.renew_locks([np.uint64(100), np.uint64(200)], np.uint64(1)) is False
+        assert (
+            bt_client.renew_locks([np.uint64(100), np.uint64(200)], np.uint64(1))
+            is False
+        )
 
 
 # ── ID Generation ─────────────────────────────────────────────────────────
@@ -510,12 +564,16 @@ class TestLogEntries:
         root_ids = np.array([100, 200], dtype=basetypes.NODE_ID)
         now = datetime.now(timezone.utc)
 
-        write_node(bt_client, op_id, {
-            attributes.OperationLogs.UserID: "alice",
-            attributes.OperationLogs.RootID: root_ids,
-            attributes.OperationLogs.Status: attributes.OperationLogs.StatusCodes.SUCCESS,
-            attributes.OperationLogs.OperationTimeStamp: now,
-        })
+        write_node(
+            bt_client,
+            op_id,
+            {
+                attributes.OperationLogs.UserID: "alice",
+                attributes.OperationLogs.RootID: root_ids,
+                attributes.OperationLogs.Status: attributes.OperationLogs.StatusCodes.SUCCESS,
+                attributes.OperationLogs.OperationTimeStamp: now,
+            },
+        )
 
         log, ts = bt_client.read_log_entry(op_id)
         assert log[attributes.OperationLogs.UserID] == "alice"
@@ -523,20 +581,24 @@ class TestLogEntries:
 
     def test_read_log_entries_by_ids(self, bt_client):
         for op_id in [1, 2]:
-            write_node(bt_client, np.uint64(op_id), {
-                attributes.OperationLogs.UserID: f"user{op_id}",
-                attributes.OperationLogs.RootID: np.array([op_id * 100], dtype=basetypes.NODE_ID),
-                attributes.OperationLogs.OperationTimeStamp: datetime.now(timezone.utc),
-            })
-        logs = bt_client.read_log_entries(
-            operation_ids=[np.uint64(1), np.uint64(2)]
-        )
+            write_node(
+                bt_client,
+                np.uint64(op_id),
+                {
+                    attributes.OperationLogs.UserID: f"user{op_id}",
+                    attributes.OperationLogs.RootID: np.array(
+                        [op_id * 100], dtype=basetypes.NODE_ID
+                    ),
+                    attributes.OperationLogs.OperationTimeStamp: datetime.now(
+                        timezone.utc
+                    ),
+                },
+            )
+        logs = bt_client.read_log_entries(operation_ids=[np.uint64(1), np.uint64(2)])
         assert len(logs) == 2
 
     def test_read_log_entries_empty(self, bt_client):
-        result = bt_client.read_log_entries(
-            operation_ids=[np.uint64(99999)]
-        )
+        result = bt_client.read_log_entries(operation_ids=[np.uint64(99999)])
         assert result == {}
 
 
@@ -547,7 +609,9 @@ class TestDataTypeRoundtrips:
     def test_numpy_array_children(self, bt_client):
         arr = np.array([10, 20, 30], dtype=basetypes.NODE_ID)
         write_node(bt_client, 100, {attributes.Hierarchy.Child: arr})
-        data = bt_client.read_node(np.uint64(100), properties=attributes.Hierarchy.Child)
+        data = bt_client.read_node(
+            np.uint64(100), properties=attributes.Hierarchy.Child
+        )
         np.testing.assert_array_equal(data[0].value, arr)
 
     def test_2d_array_cross_chunk_edges(self, bt_client):
@@ -560,12 +624,16 @@ class TestDataTypeRoundtrips:
 
     def test_scalar_parent(self, bt_client):
         write_node(bt_client, 100, {attributes.Hierarchy.Parent: np.uint64(42)})
-        data = bt_client.read_node(np.uint64(100), properties=attributes.Hierarchy.Parent)
+        data = bt_client.read_node(
+            np.uint64(100), properties=attributes.Hierarchy.Parent
+        )
         assert data[0].value == np.uint64(42)
 
     def test_string_user_id(self, bt_client):
         write_node(bt_client, 100, {attributes.OperationLogs.UserID: "alice"})
-        data = bt_client.read_node(np.uint64(100), properties=attributes.OperationLogs.UserID)
+        data = bt_client.read_node(
+            np.uint64(100), properties=attributes.OperationLogs.UserID
+        )
         assert data[0].value == "alice"
 
     def test_pickle_meta(self, bt_client):
@@ -576,7 +644,9 @@ class TestDataTypeRoundtrips:
 
     def test_compressed_array(self, bt_client):
         arr = np.array([[100, 200], [300, 400]], dtype=basetypes.NODE_ID)
-        write_node(bt_client, 100, {attributes.Connectivity.AtomicCrossChunkEdge[0]: arr})
+        write_node(
+            bt_client, 100, {attributes.Connectivity.AtomicCrossChunkEdge[0]: arr}
+        )
         data = bt_client.read_node(
             np.uint64(100), properties=attributes.Connectivity.AtomicCrossChunkEdge[0]
         )

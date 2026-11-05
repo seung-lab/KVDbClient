@@ -184,14 +184,17 @@ class RootExtension:
             )
             temp_ids_i = temp_ids[inverse]
             new_layer_mask = layer_mask.copy()
-            new_layer_mask[new_layer_mask] = self.get_chunk_layers(temp_ids_i) < stop_layer
+            new_layer_mask[new_layer_mask] = (
+                self.get_chunk_layers(temp_ids_i) < stop_layer
+            )
             result[layer_mask] = temp_ids_i
             layer_mask = new_layer_mask
             if np.all(~layer_mask):
                 break
         non_zero = result[result != 0]
-        assert not np.any(self.get_chunk_layers(non_zero) < stop_layer), \
-            "roots not found for some IDs"
+        assert not np.any(
+            self.get_chunk_layers(non_zero) < stop_layer
+        ), "roots not found for some IDs"
         return result
 
     def is_latest_roots(

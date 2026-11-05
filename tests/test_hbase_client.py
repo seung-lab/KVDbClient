@@ -13,7 +13,6 @@ from kvdbclient.serializers import serialize_uint64
 
 from helpers import write_node
 
-
 # ── Table Setup ──────────────────────────────────────────────────────────
 
 
@@ -31,6 +30,7 @@ class TestHBaseCreateTable:
 
     def test_custom_column_families(self, hbase_client_no_table):
         from kvdbclient.base import ColumnFamilyConfig
+
         families = [
             ColumnFamilyConfig("0"),
             ColumnFamilyConfig("1", max_versions=3),
@@ -47,6 +47,7 @@ class TestHBaseCreateColumnFamily:
 
     def test_create_with_config(self, hbase_client):
         from kvdbclient.base import ColumnFamilyConfig
+
         hbase_client.create_column_family(ColumnFamilyConfig("6", max_versions=2))
 
 
@@ -76,7 +77,9 @@ class TestHBaseWriteRead:
     def test_single_row(self, hbase_client):
         arr = np.array([10, 20, 30], dtype=basetypes.NODE_ID)
         write_node(hbase_client, 100, {attributes.Hierarchy.Child: arr})
-        data = hbase_client.read_node(np.uint64(100), properties=attributes.Hierarchy.Child)
+        data = hbase_client.read_node(
+            np.uint64(100), properties=attributes.Hierarchy.Child
+        )
         np.testing.assert_array_equal(data[0].value, arr)
 
     def test_bulk_write(self, hbase_client):
@@ -94,7 +97,9 @@ class TestHBaseWriteRead:
             data = hbase_client.read_node(
                 np.uint64(200 + i), properties=attributes.Hierarchy.Child
             )
-            np.testing.assert_array_equal(data[0].value, np.array([i], dtype=basetypes.NODE_ID))
+            np.testing.assert_array_equal(
+                data[0].value, np.array([i], dtype=basetypes.NODE_ID)
+            )
 
     def test_empty_write_noop(self, hbase_client):
         hbase_client.write([])
@@ -109,7 +114,9 @@ class TestHBaseWriteRead:
             {attributes.Hierarchy.Child: np.array([1], dtype=basetypes.NODE_ID)},
         )
         hbase_client.write([entry], root_ids=[root_id], operation_id=op_id)
-        data = hbase_client.read_node(np.uint64(601), properties=attributes.Hierarchy.Child)
+        data = hbase_client.read_node(
+            np.uint64(601), properties=attributes.Hierarchy.Child
+        )
         assert len(data) > 0
 
     def test_write_with_lock_renewal_failure(self, hbase_client):
@@ -127,16 +134,22 @@ class TestHBaseReadNode:
     def test_single_property(self, hbase_client):
         arr = np.array([10, 20], dtype=basetypes.NODE_ID)
         write_node(hbase_client, 100, {attributes.Hierarchy.Child: arr})
-        data = hbase_client.read_node(np.uint64(100), properties=attributes.Hierarchy.Child)
+        data = hbase_client.read_node(
+            np.uint64(100), properties=attributes.Hierarchy.Child
+        )
         np.testing.assert_array_equal(data[0].value, arr)
 
     def test_multiple_properties(self, hbase_client):
         child_arr = np.array([10], dtype=basetypes.NODE_ID)
         parent_val = np.uint64(42)
-        write_node(hbase_client, 100, {
-            attributes.Hierarchy.Child: child_arr,
-            attributes.Hierarchy.Parent: parent_val,
-        })
+        write_node(
+            hbase_client,
+            100,
+            {
+                attributes.Hierarchy.Child: child_arr,
+                attributes.Hierarchy.Parent: parent_val,
+            },
+        )
         data = hbase_client.read_node(
             np.uint64(100),
             properties=[attributes.Hierarchy.Child, attributes.Hierarchy.Parent],
@@ -152,9 +165,15 @@ class TestHBaseReadNode:
 class TestHBaseReadNodes:
     def test_by_ids(self, hbase_client):
         for nid in [100, 200, 300]:
-            write_node(hbase_client, nid, {
-                attributes.Hierarchy.Child: np.array([nid], dtype=basetypes.NODE_ID),
-            })
+            write_node(
+                hbase_client,
+                nid,
+                {
+                    attributes.Hierarchy.Child: np.array(
+                        [nid], dtype=basetypes.NODE_ID
+                    ),
+                },
+            )
         data = hbase_client.read_nodes(
             node_ids=[np.uint64(100), np.uint64(200), np.uint64(300)],
             properties=attributes.Hierarchy.Child,
@@ -163,9 +182,15 @@ class TestHBaseReadNodes:
 
     def test_by_range(self, hbase_client):
         for nid in [100, 200, 300]:
-            write_node(hbase_client, nid, {
-                attributes.Hierarchy.Child: np.array([nid], dtype=basetypes.NODE_ID),
-            })
+            write_node(
+                hbase_client,
+                nid,
+                {
+                    attributes.Hierarchy.Child: np.array(
+                        [nid], dtype=basetypes.NODE_ID
+                    ),
+                },
+            )
         data = hbase_client.read_nodes(
             start_id=np.uint64(100),
             end_id=np.uint64(301),
@@ -184,9 +209,15 @@ class TestHBaseReadNodes:
 class TestHBaseReadAllRows:
     def test_returns_written_rows(self, hbase_client):
         for nid in [100, 200, 300]:
-            write_node(hbase_client, nid, {
-                attributes.Hierarchy.Child: np.array([nid], dtype=basetypes.NODE_ID),
-            })
+            write_node(
+                hbase_client,
+                nid,
+                {
+                    attributes.Hierarchy.Child: np.array(
+                        [nid], dtype=basetypes.NODE_ID
+                    ),
+                },
+            )
         result = hbase_client.read_all_rows()
         assert len(result.rows) >= 5  # 3 nodes + meta + version
 
@@ -196,9 +227,13 @@ class TestHBaseReadAllRows:
 
 class TestHBaseDelete:
     def test_delete_row(self, hbase_client):
-        row_key = write_node(hbase_client, 100, {
-            attributes.Hierarchy.Child: np.array([10], dtype=basetypes.NODE_ID),
-        })
+        row_key = write_node(
+            hbase_client,
+            100,
+            {
+                attributes.Hierarchy.Child: np.array([10], dtype=basetypes.NODE_ID),
+            },
+        )
         data = hbase_client.read_node(np.uint64(100))
         assert len(data) > 0
 
@@ -226,7 +261,9 @@ class TestHBaseLocking:
 
     def test_lock_indefinitely(self, hbase_client):
         assert hbase_client.lock_root_indefinitely(np.uint64(100), np.uint64(1)) is True
-        assert hbase_client.lock_root_indefinitely(np.uint64(100), np.uint64(2)) is False
+        assert (
+            hbase_client.lock_root_indefinitely(np.uint64(100), np.uint64(2)) is False
+        )
 
     def test_unlock_indefinitely(self, hbase_client):
         root, op1, op2 = np.uint64(100), np.uint64(1), np.uint64(2)
@@ -298,7 +335,9 @@ class TestHBaseLockRootsIndefinitely:
         roots = [np.uint64(100), np.uint64(200), np.uint64(300)]
         op = np.uint64(1)
         future_d = {r: np.array([], dtype=np.uint64) for r in roots}
-        success, locked, failed = hbase_client.lock_roots_indefinitely(roots, op, future_d)
+        success, locked, failed = hbase_client.lock_roots_indefinitely(
+            roots, op, future_d
+        )
         assert success is True
         assert len(locked) == 3
         assert len(failed) == 0
@@ -309,7 +348,9 @@ class TestHBaseLockRootsIndefinitely:
 
         op = np.uint64(1)
         future_d = {r: np.array([], dtype=np.uint64) for r in roots}
-        success, locked, failed = hbase_client.lock_roots_indefinitely(roots, op, future_d)
+        success, locked, failed = hbase_client.lock_roots_indefinitely(
+            roots, op, future_d
+        )
         assert success is False
         assert np.uint64(200) in failed
 
@@ -327,7 +368,10 @@ class TestHBaseRenewLocks:
     def test_one_fails(self, hbase_client):
         hbase_client.lock_root(np.uint64(100), np.uint64(1))
         hbase_client.lock_root(np.uint64(200), np.uint64(2))
-        assert hbase_client.renew_locks([np.uint64(100), np.uint64(200)], np.uint64(1)) is False
+        assert (
+            hbase_client.renew_locks([np.uint64(100), np.uint64(200)], np.uint64(1))
+            is False
+        )
 
 
 class TestHBaseGetLockTimestamp:
@@ -429,7 +473,9 @@ class TestHBaseNodeIds:
         chunk_id = np.uint64(1 << 32)
         hbase_client.create_node_ids(chunk_id, 3)  # counter at 3
         node_id = chunk_id | np.uint64(7)
-        hbase_client.set_max_node_id(chunk_id, node_id)  # increments by 7 -> counter at 10
+        hbase_client.set_max_node_id(
+            chunk_id, node_id
+        )  # increments by 7 -> counter at 10
         max_id = hbase_client.get_max_node_id(chunk_id)
         assert int(np.uint64(max_id) ^ np.uint64(chunk_id)) == 10
 
@@ -452,21 +498,29 @@ class TestHBaseDataTypeRoundtrips:
     def test_numpy_array(self, hbase_client):
         arr = np.array([10, 20, 30], dtype=basetypes.NODE_ID)
         write_node(hbase_client, 100, {attributes.Hierarchy.Child: arr})
-        data = hbase_client.read_node(np.uint64(100), properties=attributes.Hierarchy.Child)
+        data = hbase_client.read_node(
+            np.uint64(100), properties=attributes.Hierarchy.Child
+        )
         np.testing.assert_array_equal(data[0].value, arr)
 
     def test_scalar(self, hbase_client):
         write_node(hbase_client, 100, {attributes.Hierarchy.Parent: np.uint64(42)})
-        data = hbase_client.read_node(np.uint64(100), properties=attributes.Hierarchy.Parent)
+        data = hbase_client.read_node(
+            np.uint64(100), properties=attributes.Hierarchy.Parent
+        )
         assert data[0].value == np.uint64(42)
 
     def test_string(self, hbase_client):
         write_node(hbase_client, 100, {attributes.OperationLogs.UserID: "alice"})
-        data = hbase_client.read_node(np.uint64(100), properties=attributes.OperationLogs.UserID)
+        data = hbase_client.read_node(
+            np.uint64(100), properties=attributes.OperationLogs.UserID
+        )
         assert data[0].value == "alice"
 
     def test_pickle_meta(self, hbase_client):
         meta = {"complex": [1, 2, 3]}
         write_node(hbase_client, 100, {attributes.TableMeta.Meta: meta})
-        data = hbase_client.read_node(np.uint64(100), properties=attributes.TableMeta.Meta)
+        data = hbase_client.read_node(
+            np.uint64(100), properties=attributes.TableMeta.Meta
+        )
         assert data[0].value == meta

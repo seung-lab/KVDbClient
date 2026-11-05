@@ -51,12 +51,14 @@ def row_to_column_dict(row) -> Dict[attributes._Attribute, list]:
     for cell in row.cells:
         attr = attributes.from_key(cell.family, cell.qualifier)
         ts = datetime.fromtimestamp(cell.timestamp_micros / 1_000_000, tz=timezone.utc)
-        column_dict.setdefault(attr, []).append(BaseCell(value=cell.value, timestamp=ts))
+        column_dict.setdefault(attr, []).append(
+            BaseCell(value=cell.value, timestamp=ts)
+        )
     return column_dict
 
 
 def _get_column_filter(
-    columns: Union[Iterable[attributes._Attribute], attributes._Attribute] = None
+    columns: Union[Iterable[attributes._Attribute], attributes._Attribute] = None,
 ) -> RowFilter:
     """Generates a RowFilter that accepts the specified columns"""
     if isinstance(columns, attributes._Attribute):
@@ -140,10 +142,12 @@ def get_row_key_lock_filter(lock_column, lock_expiry) -> RowFilterChain:
     time_cutoff = datetime.now(timezone.utc) - lock_expiry
     # Comply to resolution of BigTables TimeRange
     time_cutoff -= timedelta(microseconds=time_cutoff.microsecond % 1000)
-    return RowFilterChain([
-        TimestampRangeFilter(start=time_cutoff),
-        _exact_column_filter(lock_column),
-    ])
+    return RowFilterChain(
+        [
+            TimestampRangeFilter(start=time_cutoff),
+            _exact_column_filter(lock_column),
+        ]
+    )
 
 
 def get_root_lock_filter(
@@ -154,10 +158,12 @@ def get_root_lock_filter(
     # root (has NewParent) cannot be acquired even though its lock cell
     # is free.
     return ConditionalRowFilter(
-        predicate_filter=RowFilterUnion([
-            _exact_column_filter(indefinite_lock_column),
-            get_row_key_lock_filter(lock_column, lock_expiry),
-        ]),
+        predicate_filter=RowFilterUnion(
+            [
+                _exact_column_filter(indefinite_lock_column),
+                get_row_key_lock_filter(lock_column, lock_expiry),
+            ]
+        ),
         true_filter=PassAllFilter(True),
         false_filter=_exact_column_filter(attributes.Hierarchy.NewParent),
     )
@@ -176,10 +182,12 @@ def get_row_key_lock_filter_with_indefinite(
     temporal acquire must see it and refuse rather than racing into
     partial state.
     """
-    return RowFilterUnion([
-        _exact_column_filter(indefinite_lock_column),
-        get_row_key_lock_filter(lock_column, lock_expiry),
-    ])
+    return RowFilterUnion(
+        [
+            _exact_column_filter(indefinite_lock_column),
+            get_row_key_lock_filter(lock_column, lock_expiry),
+        ]
+    )
 
 
 def get_indefinite_root_lock_filter(lock_column) -> ConditionalRowFilter:
@@ -209,10 +217,12 @@ def get_row_key_renew_lock_filter(
     SetCell in `true_case_mutations`). No NewParent handling — arbitrary
     rows have no hierarchy relationship.
     """
-    return RowFilterChain([
-        _exact_column_filter(lock_column),
-        _exact_value_filter(lock_column.serialize(operation_id)),
-    ])
+    return RowFilterChain(
+        [
+            _exact_column_filter(lock_column),
+            _exact_value_filter(lock_column.serialize(operation_id)),
+        ]
+    )
 
 
 def get_renew_lock_filter(
@@ -236,15 +246,19 @@ def get_unlock_root_filter(lock_column, lock_expiry, operation_id) -> RowFilterC
     time_cutoff -= timedelta(microseconds=time_cutoff.microsecond % 1000)
     time_filter = TimestampRangeFilter(start=time_cutoff)
 
-    return RowFilterChain([
-        time_filter,
-        _exact_column_filter(lock_column),
-        _exact_value_filter(lock_column.serialize(operation_id)),
-    ])
+    return RowFilterChain(
+        [
+            time_filter,
+            _exact_column_filter(lock_column),
+            _exact_value_filter(lock_column.serialize(operation_id)),
+        ]
+    )
 
 
 def get_indefinite_unlock_root_filter(lock_column, operation_id) -> RowFilterChain:
-    return RowFilterChain([
-        _exact_column_filter(lock_column),
-        _exact_value_filter(lock_column.serialize(operation_id)),
-    ])
+    return RowFilterChain(
+        [
+            _exact_column_filter(lock_column),
+            _exact_value_filter(lock_column.serialize(operation_id)),
+        ]
+    )

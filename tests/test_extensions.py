@@ -10,7 +10,6 @@ from kvdbclient import basetypes
 
 from helpers import write_node
 
-
 # ── is_latest_roots ───────────────────────────────────────────────────────
 
 CREATED = datetime(2024, 1, 1, tzinfo=timezone.utc)
@@ -54,7 +53,10 @@ class TestIsLatestRoots:
     def test_childless_row_is_not_latest(self, edited_client):
         childless = 400
         write_node(
-            edited_client, childless, {attributes.Hierarchy.Parent: np.uint64(OLD_ROOT)}, CREATED
+            edited_client,
+            childless,
+            {attributes.Hierarchy.Parent: np.uint64(OLD_ROOT)},
+            CREATED,
         )
         latest = edited_client.root_ext.is_latest_roots([childless])
         np.testing.assert_array_equal(latest, [False])
@@ -65,7 +67,9 @@ class TestIsLatestRoots:
         latest = edited_client.root_ext.is_latest_roots(
             [NEW_ROOT, OLD_ROOT, *absent, OLD_ROOT, NEW_ROOT]
         )
-        np.testing.assert_array_equal(latest, [True, False, *[False] * len(absent), False, True])
+        np.testing.assert_array_equal(
+            latest, [True, False, *[False] * len(absent), False, True]
+        )
 
     def test_empty(self, edited_client):
         latest = edited_client.root_ext.is_latest_roots([])

@@ -60,4 +60,6 @@ def get_default_client_info():
     name = environ.get("PCG_BACKEND_TYPE", "bigtable").lower()
     if name not in available_backends():
         name = "bigtable"
-    return BackendClientInfo(TYPE=name, CONFIG=resolve_client(name).default_client_info())
+    return BackendClientInfo(
+        TYPE=name, CONFIG=resolve_client(name).default_client_info()
+    )

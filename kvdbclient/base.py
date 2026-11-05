@@ -25,6 +25,7 @@ from .registry import register_backend
 @dataclass(frozen=True)
 class ColumnFamilyConfig:
     """Backend-agnostic column family definition."""
+
     family_id: str
     max_versions: typing.Optional[int] = None
     max_age: typing.Optional[timedelta] = None
@@ -130,7 +131,9 @@ class SimpleClient(ABC):
         Returns a backend-specific mutation object consumed by write().
         """
 
-    def write(self, rows, root_ids=None, operation_id=None, slow_retry=True, block_size=2000):
+    def write(
+        self, rows, root_ids=None, operation_id=None, slow_retry=True, block_size=2000
+    ):
         """Write a list of mutated rows in bulk."""
         if root_ids is not None and operation_id is not None:
             if isinstance(root_ids, int):
@@ -234,11 +237,29 @@ class SimpleClient(ABC):
         """Delete an entire row."""
 
     @abstractmethod
-    def _read_byte_row(self, row_key, columns=None, start_time=None, end_time=None, end_time_inclusive=False):
+    def _read_byte_row(
+        self,
+        row_key,
+        columns=None,
+        start_time=None,
+        end_time=None,
+        end_time_inclusive=False,
+    ):
         """Read a single row (raw bytes, deserialized by column attribute)."""
 
     @abstractmethod
-    def _read_byte_rows(self, start_key=None, end_key=None, end_key_inclusive=False, row_keys=None, columns=None, start_time=None, end_time=None, end_time_inclusive=False, user_id=None):
+    def _read_byte_rows(
+        self,
+        start_key=None,
+        end_key=None,
+        end_key_inclusive=False,
+        row_keys=None,
+        columns=None,
+        start_time=None,
+        end_time=None,
+        end_time_inclusive=False,
+        user_id=None,
+    ):
         """Read multiple rows (raw bytes, deserialized by column attribute)."""
 
     @abstractmethod
@@ -267,9 +288,7 @@ class SimpleClient(ABC):
         except KeyError:
             return None
 
-    def update_table_meta(
-        self, meta, overwrite: typing.Optional[bool] = False
-    ):
+    def update_table_meta(self, meta, overwrite: typing.Optional[bool] = False):
         if overwrite:
             self._delete_meta()
         self._table_meta = meta
@@ -618,9 +637,7 @@ class ClientWithIDGen(SimpleClient):
     ) -> basetypes.NODE_ID:
         return self.create_node_ids(chunk_id, 1, root_chunk=root_chunk)[0]
 
-    def set_max_node_id(
-        self, chunk_id: np.uint64, node_id: np.uint64
-    ) -> None:
+    def set_max_node_id(self, chunk_id: np.uint64, node_id: np.uint64) -> None:
         """Set max segment ID for a given chunk."""
         size = int(np.uint64(chunk_id) ^ np.uint64(node_id))
         self._get_ids_range(serialize_uint64(chunk_id, counter=True), size)
