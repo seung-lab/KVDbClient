@@ -76,10 +76,8 @@ class ForkClient(Client):
         self._source = None
         self._pool = None
 
-    def attach(self, marker: typing.Optional[ForkMarker]) -> None:
+    def attach(self, marker: ForkMarker) -> None:
         """Read below `TF` from the marker's source, a fork itself while chain lasts."""
-        if marker is None:
-            return
         if marker.state is not MarkerState.READY:
             raise exceptions.ForkTableError(
                 f"fork {self._table_id} is {marker.state.value}"

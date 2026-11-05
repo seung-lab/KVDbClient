@@ -4,7 +4,7 @@ It lives in the fork's meta row, so the read every open already makes returns it
 """
 
 import json
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
 from typing import NamedTuple
@@ -36,15 +36,8 @@ class ForkMarker:
     requested_at: datetime
 
     @property
-    def source(self) -> str:
-        return self.chain[0].table
-
-    @property
     def tf(self) -> datetime:
         return self.chain[0].tf
-
-    def with_state(self, state: MarkerState) -> "ForkMarker":
-        return replace(self, state=state)
 
     def to_json(self) -> str:
         return json.dumps(

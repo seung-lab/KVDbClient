@@ -10,6 +10,8 @@ from kvdbclient import attributes
 from kvdbclient import basetypes
 from kvdbclient import exceptions
 from kvdbclient.base import Cell
+from kvdbclient.bigtable import BigTableConfig
+from kvdbclient.bigtable import client as bigtable_client
 from kvdbclient.serializers import serialize_uint64
 
 from helpers import write_node
@@ -331,3 +333,43 @@ class TestShardedRead:
             properties=attributes.Hierarchy.Child,
         )
         assert len(data) == count
+
+
+# ── Closing ──────────────────────────────────────────────────────────────
+
+
+class TestClose:
+    def test_close_shuts_the_data_client_it_owns(self, bt_config):
+        client = bigtable_client.Client(table_id="test_close", config=bt_config)
+        client.close()
+        assert not client._finalizer.alive
+
+    def test_close_leaves_a_shared_data_client_open(self, bt_client, bt_config):
+        sharer = bigtable_client.Client(
+            table_id=bt_client._table_id,
+            config=bt_config,
+            data_client=bt_client._data_client,
+        )
+        sharer.close()
+        assert bt_client.read_table_meta() == {"test": True}
+
+
+# ── Credentials ──────────────────────────────────────────────────────────
+
+
+class TestCredentials:
+    def test_config_credentials_reach_the_data_client(self, monkeypatch):
+        seen = {}
+
+        class _DataClient:
+            def __init__(self, **kwargs):
+                seen.update(kwargs)
+
+            def get_table(self, *args, **kwargs):
+                return None
+
+        monkeypatch.setattr(bigtable_client, "BigtableDataClient", _DataClient)
+        credentials = object()
+        config = BigTableConfig(PROJECT="p", INSTANCE="i", CREDENTIALS=credentials)
+        bigtable_client.Client(table_id="t", config=config)
+        assert seen["credentials"] is credentials

@@ -1,6 +1,7 @@
 """A fork reads its table merged with its source's, capped at `TF`, and writes nothing."""
 
 import uuid
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 
 import numpy as np
@@ -153,3 +154,31 @@ def test_a_fork_of_a_fork_reads_the_source_capped_at_the_earlier_tf(
     assert _values(second._read_byte_row(ROW, columns=PARENT)) == [6, 1]
     reopened = open_client(second._table_id, config=bt_config)
     assert _values(reopened._read_byte_row(ROW, columns=PARENT)) == [6, 1]
+
+
+def test_a_fork_whose_creation_never_finished_does_not_open(source, bt_config):
+    """`CREATING` marks a half-built fork, so it is refused rather than read."""
+    marker = replace(_marker(Hop(source._table_id, TF1)), state=MarkerState.CREATING)
+    table_id = _name()
+    with pytest.raises(ForkTableError, match="creating"):
+        create_fork_table(table_id, marker, {"test": True}, "0.0.1", config=bt_config)
+    with pytest.raises(ForkTableError, match="creating"):
+        open_client(table_id, config=bt_config)
+
+
+def test_closing_a_fork_stops_the_source_pool_at_every_hop(fork, source, bt_config):
+    marker = _marker(Hop(fork._table_id, TF2), Hop(source._table_id, TF1))
+    second = create_fork_table(
+        _name(), marker, {"test": True}, "0.0.1", config=bt_config
+    )
+    second.close()
+    for client in (second, second._source):
+        with pytest.raises(RuntimeError, match="shutdown"):
+            client._pool.submit(int)
+
+
+def test_a_plain_table_opened_for_forks_still_updates_its_meta(source, bt_config):
+    opened = open_client(source._table_id, config=bt_config)
+    opened.update_table_meta({"test": False}, overwrite=True)
+    reopened = open_client(source._table_id, config=bt_config)
+    assert reopened.read_table_meta() == {"test": False}
