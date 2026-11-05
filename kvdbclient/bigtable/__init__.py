@@ -10,7 +10,7 @@ _bigtableconfig_fields = (
     "ADMIN",
     "READ_ONLY",
     "CREDENTIALS",
-    "MAX_ROW_KEY_COUNT"
+    "MAX_ROW_KEY_COUNT",
 )
 _bigtableconfig_defaults = (
     environ.get("BIGTABLE_PROJECT", DEFAULT_PROJECT),
@@ -18,7 +18,7 @@ _bigtableconfig_defaults = (
     False,
     True,
     None,
-    10000
+    10000,
 )
 BigTableConfig = namedtuple(
     "BigTableConfig", _bigtableconfig_fields, defaults=_bigtableconfig_defaults

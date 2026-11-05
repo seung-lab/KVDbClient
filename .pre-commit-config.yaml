@@ -1,0 +1,14 @@
+repos:
+  - repo: https://github.com/psf/black
+    rev: 26.10.1
+    hooks:
+      - id: black
+  - repo: local
+    hooks:
+      - id: tests
+        name: tests
+        # Only the index's test files, so a commit is tested as it is staged.
+        entry: bash -c 'python -m pytest -q $(git ls-files "tests/test_*.py")'
+        language: system
+        types: [python]
+        pass_filenames: false

@@ -28,7 +28,9 @@ def _wait_for_port(host: str, port: int, timeout: float = 30.0) -> None:
                 return
         except OSError:
             sleep(0.2)
-    raise RuntimeError(f"bigtable emulator on {host}:{port} not ready within {timeout}s")
+    raise RuntimeError(
+        f"bigtable emulator on {host}:{port} not ready within {timeout}s"
+    )
 
 
 @contextmanager
@@ -44,7 +46,14 @@ def bigtable_emulator():
     port = _free_port()
     host_port = f"localhost:{port}"
     proc = subprocess.Popen(
-        ["gcloud", "beta", "emulators", "bigtable", "start", f"--host-port={host_port}"],
+        [
+            "gcloud",
+            "beta",
+            "emulators",
+            "bigtable",
+            "start",
+            f"--host-port={host_port}",
+        ],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
@@ -66,7 +75,10 @@ class _BigtableEmulatorHarness(BackendHarness):
     name = "bigtable"
 
     def available(self) -> bool:
-        return bool(os.environ.get("BIGTABLE_EMULATOR_HOST")) or which("gcloud") is not None
+        return (
+            bool(os.environ.get("BIGTABLE_EMULATOR_HOST"))
+            or which("gcloud") is not None
+        )
 
     @contextmanager
     def server(self):

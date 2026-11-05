@@ -14,7 +14,6 @@ from kvdbclient.serializers import serialize_uint64
 
 from helpers import write_node
 
-
 # ── Cell equality ─────────────────────────────────────────────────────────
 
 
@@ -104,9 +103,13 @@ class TestConsolidatedLockTimestamp:
 class TestTimeFilteredReads:
     def test_read_with_start_time(self, bt_client):
         now = datetime.now(timezone.utc)
-        write_node(bt_client, 100, {
-            attributes.Hierarchy.Child: np.array([10], dtype=basetypes.NODE_ID),
-        })
+        write_node(
+            bt_client,
+            100,
+            {
+                attributes.Hierarchy.Child: np.array([10], dtype=basetypes.NODE_ID),
+            },
+        )
         data = bt_client.read_node(
             np.uint64(100),
             properties=attributes.Hierarchy.Child,
@@ -115,9 +118,13 @@ class TestTimeFilteredReads:
         assert len(data) > 0
 
     def test_read_with_future_start_time_returns_empty(self, bt_client):
-        write_node(bt_client, 100, {
-            attributes.Hierarchy.Child: np.array([10], dtype=basetypes.NODE_ID),
-        })
+        write_node(
+            bt_client,
+            100,
+            {
+                attributes.Hierarchy.Child: np.array([10], dtype=basetypes.NODE_ID),
+            },
+        )
         data = bt_client.read_node(
             np.uint64(100),
             properties=attributes.Hierarchy.Child,
@@ -126,9 +133,13 @@ class TestTimeFilteredReads:
         assert len(data) == 0
 
     def test_read_with_end_time(self, bt_client):
-        write_node(bt_client, 100, {
-            attributes.Hierarchy.Child: np.array([10], dtype=basetypes.NODE_ID),
-        })
+        write_node(
+            bt_client,
+            100,
+            {
+                attributes.Hierarchy.Child: np.array([10], dtype=basetypes.NODE_ID),
+            },
+        )
         data = bt_client.read_node(
             np.uint64(100),
             properties=attributes.Hierarchy.Child,
@@ -143,11 +154,19 @@ class TestTimeFilteredReads:
 class TestUserFilteredReads:
     def test_read_log_entries_by_user(self, bt_client):
         for i, user in enumerate(["alice", "bob"]):
-            write_node(bt_client, np.uint64(i + 1), {
-                attributes.OperationLogs.UserID: user,
-                attributes.OperationLogs.RootID: np.array([100 * (i + 1)], dtype=basetypes.NODE_ID),
-                attributes.OperationLogs.OperationTimeStamp: datetime.now(timezone.utc),
-            })
+            write_node(
+                bt_client,
+                np.uint64(i + 1),
+                {
+                    attributes.OperationLogs.UserID: user,
+                    attributes.OperationLogs.RootID: np.array(
+                        [100 * (i + 1)], dtype=basetypes.NODE_ID
+                    ),
+                    attributes.OperationLogs.OperationTimeStamp: datetime.now(
+                        timezone.utc
+                    ),
+                },
+            )
         # Create max op ID so read_log_entries can determine range
         bt_client.create_operation_id()
         bt_client.create_operation_id()
@@ -163,17 +182,27 @@ class TestUserFilteredReads:
 
 class TestDeleteCellsTimestamp:
     def test_delete_specific_cell_version(self, bt_client):
-        write_node(bt_client, 100, {
-            attributes.Hierarchy.Child: np.array([10], dtype=basetypes.NODE_ID),
-        })
-        data = bt_client.read_node(np.uint64(100), properties=attributes.Hierarchy.Child)
+        write_node(
+            bt_client,
+            100,
+            {
+                attributes.Hierarchy.Child: np.array([10], dtype=basetypes.NODE_ID),
+            },
+        )
+        data = bt_client.read_node(
+            np.uint64(100), properties=attributes.Hierarchy.Child
+        )
         assert len(data) > 0
         ts = data[0].timestamp
 
-        bt_client.delete_cells([
-            (serialize_uint64(np.uint64(100)), attributes.Hierarchy.Child, [ts]),
-        ])
-        data = bt_client.read_node(np.uint64(100), properties=attributes.Hierarchy.Child)
+        bt_client.delete_cells(
+            [
+                (serialize_uint64(np.uint64(100)), attributes.Hierarchy.Child, [ts]),
+            ]
+        )
+        data = bt_client.read_node(
+            np.uint64(100), properties=attributes.Hierarchy.Child
+        )
         assert len(data) == 0
 
 
@@ -183,9 +212,13 @@ class TestDeleteCellsTimestamp:
 class TestReadNodesEdgeCases:
     def test_end_id_inclusive(self, bt_client):
         nid = np.uint64(100)
-        write_node(bt_client, nid, {
-            attributes.Hierarchy.Child: np.array([10], dtype=basetypes.NODE_ID),
-        })
+        write_node(
+            bt_client,
+            nid,
+            {
+                attributes.Hierarchy.Child: np.array([10], dtype=basetypes.NODE_ID),
+            },
+        )
         data = bt_client.read_nodes(
             start_id=nid,
             end_id=nid,
@@ -202,15 +235,21 @@ class TestReadNodesEdgeCases:
             {attributes.Hierarchy.Child: np.array([10], dtype=basetypes.NODE_ID)},
         )
         bt_client.write([entry])
-        data = bt_client.read_node(nid, fake_edges=True, properties=attributes.Hierarchy.Child)
+        data = bt_client.read_node(
+            nid, fake_edges=True, properties=attributes.Hierarchy.Child
+        )
         assert len(data) > 0
 
 
 class TestEmptyColumnFilter:
     def test_raises_value_error(self, bt_client):
-        write_node(bt_client, 100, {
-            attributes.Hierarchy.Child: np.array([10], dtype=basetypes.NODE_ID),
-        })
+        write_node(
+            bt_client,
+            100,
+            {
+                attributes.Hierarchy.Child: np.array([10], dtype=basetypes.NODE_ID),
+            },
+        )
         with pytest.raises(ValueError, match="Empty column filter"):
             bt_client.read_nodes(
                 node_ids=[np.uint64(100)],
@@ -244,11 +283,19 @@ class TestReadLogEntriesByRange:
         op1 = bt_client.create_operation_id()
         op2 = bt_client.create_operation_id()
         for op_id in [op1, op2]:
-            write_node(bt_client, op_id, {
-                attributes.OperationLogs.UserID: "tester",
-                attributes.OperationLogs.RootID: np.array([100], dtype=basetypes.NODE_ID),
-                attributes.OperationLogs.OperationTimeStamp: datetime.now(timezone.utc),
-            })
+            write_node(
+                bt_client,
+                op_id,
+                {
+                    attributes.OperationLogs.UserID: "tester",
+                    attributes.OperationLogs.RootID: np.array(
+                        [100], dtype=basetypes.NODE_ID
+                    ),
+                    attributes.OperationLogs.OperationTimeStamp: datetime.now(
+                        timezone.utc
+                    ),
+                },
+            )
         logs = bt_client.read_log_entries()
         assert len(logs) >= 2
 
@@ -267,10 +314,16 @@ class TestShardedRead:
         for i in range(count):
             nid = np.uint64(base + i)
             node_ids.append(nid)
-            entries.append(client.mutate_row(
-                serialize_uint64(nid),
-                {attributes.Hierarchy.Child: np.array([i], dtype=basetypes.NODE_ID)},
-            ))
+            entries.append(
+                client.mutate_row(
+                    serialize_uint64(nid),
+                    {
+                        attributes.Hierarchy.Child: np.array(
+                            [i], dtype=basetypes.NODE_ID
+                        )
+                    },
+                )
+            )
         client.write(entries)
 
         data = client.read_nodes(

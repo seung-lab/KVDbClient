@@ -8,7 +8,9 @@ def register_backend(client_cls) -> None:
     name = client_cls.backend_name
     existing = _REGISTRY.get(name)
     if existing is not None and existing is not client_cls:
-        raise TypeError(f"backend name {name!r} already registered to {existing.__name__}")
+        raise TypeError(
+            f"backend name {name!r} already registered to {existing.__name__}"
+        )
     _REGISTRY[name] = client_cls
 
 

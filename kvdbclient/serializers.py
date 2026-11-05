@@ -87,13 +87,16 @@ class JSON(_Serializer):
 
 class _Surrogate:
     """Stand-in for unknown classes during lenient unpickling."""
+
     def __new__(cls, *args):
         obj = object.__new__(cls)
         if args:
             obj._surrogate_args = args  # preserve namedtuple positional fields
         return obj
+
     def __init__(self, *_):
         pass
+
     def __setstate__(self, state):
         if isinstance(state, dict):
             self.__dict__.update(state)
@@ -101,6 +104,7 @@ class _Surrogate:
 
 class _LenientUnpickler(pickle.Unpickler):
     """Unpickler that replaces unknown classes with _Surrogate."""
+
     def find_class(self, module, name):
         try:
             return super().find_class(module, name)
@@ -154,7 +158,9 @@ def serialize_uint64(node_id: np.uint64, counter=False, fake_edges=False) -> byt
     return serialize_key(pad_node_id(node_id))  # type: ignore
 
 
-def serialize_uint64_batch(node_ids: Iterable[np.uint64], fake_edges: bool = False) -> list:
+def serialize_uint64_batch(
+    node_ids: Iterable[np.uint64], fake_edges: bool = False
+) -> list:
     """Batch-serialize node IDs to row keys.
 
     Inlines pad_node_id + serialize_key into a single f-string per element

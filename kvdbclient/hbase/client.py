@@ -10,12 +10,23 @@ from datetime import datetime, timedelta, timezone
 import numpy as np
 import requests
 from requests.adapters import HTTPAdapter
-from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+from tenacity import (
+    retry,
+    stop_after_attempt,
+    wait_exponential,
+    retry_if_exception_type,
+)
 
 from . import HBaseConfig
 from . import get_client_info
 from . import utils as hbase_utils
-from ..base import Cell, ClientWithIDGen, ColumnFamilyConfig, DEFAULT_COLUMN_FAMILIES, OperationLogger
+from ..base import (
+    Cell,
+    ClientWithIDGen,
+    ColumnFamilyConfig,
+    DEFAULT_COLUMN_FAMILIES,
+    OperationLogger,
+)
 from .. import attributes
 from .. import exceptions
 from ..serializers import serialize_uint64
@@ -102,10 +113,12 @@ class Client(ClientWithIDGen, OperationLogger):
         adapter = HTTPAdapter(pool_connections=1, pool_maxsize=32)
         self._session.mount("http://", adapter)
         self._session.mount("https://", adapter)
-        self._session.headers.update({
-            "Accept": "application/json",
-            "Content-Type": "application/json",
-        })
+        self._session.headers.update(
+            {
+                "Accept": "application/json",
+                "Content-Type": "application/json",
+            }
+        )
 
         self._init_common(
             logger_name=f"hbase/{table_id}",
@@ -275,7 +288,9 @@ class Client(ClientWithIDGen, OperationLogger):
             return False
         return True
 
-    def lock_root_indefinitely(self, root_id: np.uint64, operation_id: np.uint64) -> bool:
+    def lock_root_indefinitely(
+        self, root_id: np.uint64, operation_id: np.uint64
+    ) -> bool:
         # Not routed through `_acquire_lock_cell` on purpose: that helper
         # treats stale cells as expired and deletes them, but indefinite
         # locks never expire — so a stale-looking cell here is still held.
@@ -306,7 +321,9 @@ class Client(ClientWithIDGen, OperationLogger):
             serialize_uint64(root_id), operation_id, attributes.Concurrency.Lock
         )
 
-    def unlock_indefinitely_locked_root(self, root_id: np.uint64, operation_id: np.uint64):
+    def unlock_indefinitely_locked_root(
+        self, root_id: np.uint64, operation_id: np.uint64
+    ):
         return self._release_lock_cell(
             serialize_uint64(root_id),
             operation_id,
@@ -379,12 +396,14 @@ class Client(ClientWithIDGen, OperationLogger):
         )
 
     def renew_lock_by_row_key(self, row_key: bytes, operation_id: np.uint64) -> bool:
-        return self._renew_lock_cell(
-            row_key, operation_id, attributes.Concurrency.Lock
-        )
+        return self._renew_lock_cell(row_key, operation_id, attributes.Concurrency.Lock)
 
-    def get_compatible_timestamp(self, time_stamp: datetime, round_up: bool = False) -> datetime:
-        return hbase_utils.get_hbase_compatible_time_stamp(time_stamp, round_up=round_up)
+    def get_compatible_timestamp(
+        self, time_stamp: datetime, round_up: bool = False
+    ) -> datetime:
+        return hbase_utils.get_hbase_compatible_time_stamp(
+            time_stamp, round_up=round_up
+        )
 
     def _get_ids_range(self, key: bytes, size: int) -> typing.Tuple:
         column = attributes.Concurrency.Counter
@@ -393,13 +412,19 @@ class Client(ClientWithIDGen, OperationLogger):
 
         url = self._table_url(f"/{key_b64}/{col_spec}")
         increment_body = {
-            "Row": [{
-                "key": hbase_utils.encode_value(key),
-                "Cell": [{
-                    "column": hbase_utils.encode_value(col_spec.encode("utf-8")),
-                    "$": hbase_utils.encode_value(struct.pack(">q", size)),
-                }],
-            }],
+            "Row": [
+                {
+                    "key": hbase_utils.encode_value(key),
+                    "Cell": [
+                        {
+                            "column": hbase_utils.encode_value(
+                                col_spec.encode("utf-8")
+                            ),
+                            "$": hbase_utils.encode_value(struct.pack(">q", size)),
+                        }
+                    ],
+                }
+            ],
         }
         resp = self._session.post(
             url,
@@ -417,7 +442,9 @@ class Client(ClientWithIDGen, OperationLogger):
         scanner_location = resp.headers.get("Location", "")
         rows = []
         while True:
-            resp = self._session.get(scanner_location, headers={"Accept": "application/json"})
+            resp = self._session.get(
+                scanner_location, headers={"Accept": "application/json"}
+            )
             if resp.status_code == 204:
                 break
             resp.raise_for_status()
@@ -447,10 +474,26 @@ class Client(ClientWithIDGen, OperationLogger):
             rows = {}
             for i in range(0, len(row_keys), self._max_row_key_count):
                 batch = row_keys[i : i + self._max_row_key_count]
-                rows.update(self._fetch_rows_by_keys(batch, col_specs, start_time, end_time, end_time_inclusive, single_column))
+                rows.update(
+                    self._fetch_rows_by_keys(
+                        batch,
+                        col_specs,
+                        start_time,
+                        end_time,
+                        end_time_inclusive,
+                        single_column,
+                    )
+                )
         elif start_key is not None and end_key is not None:
             rows = self._fetch_rows_by_range(
-                start_key, end_key, end_key_inclusive, col_specs, start_time, end_time, end_time_inclusive, single_column
+                start_key,
+                end_key,
+                end_key_inclusive,
+                col_specs,
+                start_time,
+                end_time,
+                end_time_inclusive,
+                single_column,
             )
         else:
             raise exceptions.PreconditionError(
@@ -469,7 +512,14 @@ class Client(ClientWithIDGen, OperationLogger):
                         cell_entry.value = column.deserialize(cell_entry.value)
         return rows
 
-    def _read_byte_row(self, row_key, columns=None, start_time=None, end_time=None, end_time_inclusive=False):
+    def _read_byte_row(
+        self,
+        row_key,
+        columns=None,
+        start_time=None,
+        end_time=None,
+        end_time_inclusive=False,
+    ):
         single_column = isinstance(columns, attributes._Attribute)
         row = self._read_byte_rows(
             row_keys=[row_key],
@@ -480,7 +530,15 @@ class Client(ClientWithIDGen, OperationLogger):
         )
         return row.get(row_key, [] if single_column else {})
 
-    def _fetch_rows_by_keys(self, row_keys, col_specs, start_time, end_time, end_time_inclusive, single_column=False):
+    def _fetch_rows_by_keys(
+        self,
+        row_keys,
+        col_specs,
+        start_time,
+        end_time,
+        end_time_inclusive,
+        single_column=False,
+    ):
         if not row_keys:
             return {}
         sorted_keys = sorted(row_keys)
@@ -497,7 +555,17 @@ class Client(ClientWithIDGen, OperationLogger):
         key_set = set(row_keys)
         return {k: v for k, v in all_rows.items() if k in key_set}
 
-    def _fetch_rows_by_range(self, start_key, end_key, end_key_inclusive, col_specs, start_time, end_time, end_time_inclusive, single_column=False):
+    def _fetch_rows_by_range(
+        self,
+        start_key,
+        end_key,
+        end_key_inclusive,
+        col_specs,
+        start_time,
+        end_time,
+        end_time_inclusive,
+        single_column=False,
+    ):
         scanner_spec = {
             "startRow": hbase_utils.encode_value(start_key),
             "batch": self._max_row_key_count,
@@ -517,7 +585,9 @@ class Client(ClientWithIDGen, OperationLogger):
             )
             scanner_spec["startTime"] = ts
         if end_time:
-            et = hbase_utils.get_hbase_compatible_time_stamp(end_time, round_up=end_time_inclusive)
+            et = hbase_utils.get_hbase_compatible_time_stamp(
+                end_time, round_up=end_time_inclusive
+            )
             scanner_spec["endTime"] = hbase_utils.datetime_to_hbase_ts(et)
 
         scanner_url = self._table_url("/scanner")
@@ -528,11 +598,15 @@ class Client(ClientWithIDGen, OperationLogger):
         result = {}
         try:
             while True:
-                resp = self._session.get(scanner_location, headers={"Accept": "application/json"})
+                resp = self._session.get(
+                    scanner_location, headers={"Accept": "application/json"}
+                )
                 if resp.status_code == 204:
                     break
                 resp.raise_for_status()
-                parsed = hbase_utils.parse_cell_response(resp.json(), single_column=single_column)
+                parsed = hbase_utils.parse_cell_response(
+                    resp.json(), single_column=single_column
+                )
                 result.update(parsed)
         finally:
             self._session.delete(scanner_location)
@@ -550,7 +624,7 @@ class Client(ClientWithIDGen, OperationLogger):
                 key_b64 = hbase_utils.encode_value(row_key)
                 url = self._table_url(f"/{key_b64}/{col_spec}/{ts_ms}")
                 self._session.delete(url)
-        for key in (row_keys_to_delete or []):
+        for key in row_keys_to_delete or []:
             key_b64 = hbase_utils.encode_value(key)
             self._session.delete(self._table_url(f"/{key_b64}"))
 
@@ -582,19 +656,26 @@ class Client(ClientWithIDGen, OperationLogger):
             cell["timestamp"] = hbase_utils.datetime_to_hbase_ts(put_timestamp)
 
         body = {
-            "Row": [{
-                "key": hbase_utils.encode_value(row_key),
-                "Cell": [cell],
-            }],
+            "Row": [
+                {
+                    "key": hbase_utils.encode_value(row_key),
+                    "Cell": [cell],
+                }
+            ],
         }
 
         if check_value is not None:
-            body["Row"][0]["Cell"].insert(0, {
-                "column": hbase_utils.encode_value(col_spec.encode("utf-8")),
-                "$": hbase_utils.encode_value(
-                    check_value if isinstance(check_value, bytes) else serialize_uint64(check_value)
-                ),
-            })
+            body["Row"][0]["Cell"].insert(
+                0,
+                {
+                    "column": hbase_utils.encode_value(col_spec.encode("utf-8")),
+                    "$": hbase_utils.encode_value(
+                        check_value
+                        if isinstance(check_value, bytes)
+                        else serialize_uint64(check_value)
+                    ),
+                },
+            )
 
         resp = self._session.put(url, json=body)
         return resp.status_code == 200
@@ -611,13 +692,19 @@ class Client(ClientWithIDGen, OperationLogger):
         url = self._table_url(f"/{key_b64}/{col_spec}?check=delete")
 
         body = {
-            "Row": [{
-                "key": hbase_utils.encode_value(row_key),
-                "Cell": [{
-                    "column": hbase_utils.encode_value(col_spec.encode("utf-8")),
-                    "$": hbase_utils.encode_value(check_value),
-                }],
-            }],
+            "Row": [
+                {
+                    "key": hbase_utils.encode_value(row_key),
+                    "Cell": [
+                        {
+                            "column": hbase_utils.encode_value(
+                                col_spec.encode("utf-8")
+                            ),
+                            "$": hbase_utils.encode_value(check_value),
+                        }
+                    ],
+                }
+            ],
         }
         resp = self._session.put(url, json=body)
         return resp.status_code == 200

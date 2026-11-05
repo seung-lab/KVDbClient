@@ -7,7 +7,9 @@ from .. import attributes
 from ..base import Cell
 
 
-def get_hbase_compatible_time_stamp(time_stamp: datetime, round_up: bool = False) -> datetime:
+def get_hbase_compatible_time_stamp(
+    time_stamp: datetime, round_up: bool = False
+) -> datetime:
     """Round datetime to millisecond precision.
 
     When ``round_up=True`` the result is always *strictly after* the input so
@@ -129,14 +131,18 @@ def build_cellset_json(mutations) -> dict:
         cells = []
         for col_spec, (value, timestamp) in mutation.cells.items():
             cell = {
-                "column": encode_value(col_spec.encode("utf-8") if isinstance(col_spec, str) else col_spec),
+                "column": encode_value(
+                    col_spec.encode("utf-8") if isinstance(col_spec, str) else col_spec
+                ),
                 "$": encode_value(value),
             }
             if timestamp is not None:
                 cell["timestamp"] = datetime_to_hbase_ts(timestamp)
             cells.append(cell)
-        rows.append({
-            "key": encode_value(mutation.row_key),
-            "Cell": cells,
-        })
+        rows.append(
+            {
+                "key": encode_value(mutation.row_key),
+                "Cell": cells,
+            }
+        )
     return {"Row": rows}
