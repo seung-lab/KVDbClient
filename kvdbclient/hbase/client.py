@@ -30,7 +30,7 @@ from ..base import (
 from .. import attributes
 from .. import exceptions
 from ..serializers import serialize_uint64
-from ..utils import get_valid_timestamp
+from ..utils import get_valid_timestamp, require_before
 
 
 class _PartialRowAdapter:
@@ -198,9 +198,11 @@ class Client(ClientWithIDGen, OperationLogger):
             )
         return mutation
 
-    def _write_rows(self, rows, slow_retry=True, block_size=2000):
+    def _write_rows(self, rows, slow_retry=True, block_size=2000, deadline=None):
         rows_list = list(rows)
         for i in range(0, len(rows_list), block_size):
+            if deadline is not None:
+                require_before(deadline)
             block = rows_list[i : i + block_size]
             body = hbase_utils.build_cellset_json(block)
             self._put_rows_with_retry(body, slow_retry=slow_retry)

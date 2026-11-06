@@ -8,7 +8,7 @@ import pytest
 class TestGetClientClass:
     def test_bigtable(self):
         from kvdbclient import get_client_class
-        from kvdbclient.bigtable.client import Client as BigTableClient
+        from kvdbclient.bigtable.fork import ForkClient as BigTableClient
 
         assert get_client_class("bigtable") is BigTableClient
 
@@ -26,13 +26,13 @@ class TestGetClientClass:
 
     def test_case_insensitive(self):
         from kvdbclient import get_client_class
-        from kvdbclient.bigtable.client import Client as BigTableClient
+        from kvdbclient.bigtable.fork import ForkClient as BigTableClient
 
         assert get_client_class("BigTable") is BigTableClient
 
     def test_none_defaults_to_bigtable(self):
         from kvdbclient import get_client_class
-        from kvdbclient.bigtable.client import Client as BigTableClient
+        from kvdbclient.bigtable.fork import ForkClient as BigTableClient
 
         assert get_client_class(None) is BigTableClient
 

@@ -104,6 +104,18 @@ class TestHBaseWriteRead:
     def test_empty_write_noop(self, hbase_client):
         hbase_client.write([])
 
+    def test_write_past_its_deadline_lands_nothing(self, hbase_client):
+        entry = hbase_client.mutate_row(
+            serialize_uint64(np.uint64(700)),
+            {attributes.Hierarchy.Child: np.array([1], dtype=basetypes.NODE_ID)},
+        )
+        deadline = datetime.now(timezone.utc) - timedelta(seconds=1)
+        with pytest.raises(exceptions.WriteDeadlineError):
+            hbase_client.write([entry], deadline=deadline)
+        assert not hbase_client.read_node(
+            np.uint64(700), properties=attributes.Hierarchy.Child
+        )
+
     def test_write_with_lock_renewal_success(self, hbase_client):
         root_id = np.uint64(600)
         op_id = np.uint64(1)
