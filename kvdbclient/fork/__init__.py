@@ -1,1 +1,4 @@
-"""Table forks: the marker in a fork's meta row, and the client that reads through it."""
+"""Table forks for every backend: the marker, id spaces and a client's fork behaviour.
+
+Backend mechanics live in each backend's package; nothing here imports a backend.
+"""

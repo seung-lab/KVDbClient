@@ -11,7 +11,7 @@ from kvdbclient import (
 from kvdbclient import registry
 from kvdbclient.base import SimpleClient
 from kvdbclient.bigtable import BigTableConfig
-from kvdbclient.bigtable.client import Client as BigTableClient
+from kvdbclient.bigtable.fork import ForkClient as BigTableClient
 
 
 @pytest.fixture

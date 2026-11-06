@@ -27,7 +27,7 @@ warnings.filterwarnings("ignore", message="urllib3", module="requests")
 from .base import ColumnFamilyConfig, DEFAULT_COLUMN_FAMILIES
 from .bigtable import BigTableConfig
 from .bigtable import get_client_info as get_bigtable_client_info
-from .bigtable.client import Client as BigTableClient
+from .bigtable.fork import ForkClient as BigTableClient
 from .hbase import HBaseConfig
 from .hbase import get_client_info as get_hbase_client_info
 from .hbase.client import Client as HBaseClient

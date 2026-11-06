@@ -86,7 +86,8 @@ class _ReadAllRowsResult:
 
 
 class Client(ClientWithIDGen, OperationLogger):
-    backend_name = "bigtable"
+    """One Bigtable table; the registered Bigtable client is `fork.ForkClient`."""
+
     config_class = BigTableConfig
 
     @staticmethod

@@ -39,6 +39,14 @@ DEFAULT_COLUMN_FAMILIES = [
     ColumnFamilyConfig("4"),
 ]
 
+# A root chunk counts its ids over this many rows, so concurrent edits do not contend.
+COUNTER_SHARDS = 2**8
+
+
+def counter_shard_key(chunk_id, shard) -> bytes:
+    """The row holding one shard of a chunk's sharded id counter."""
+    return serialize_key(f"i{pad_node_id(chunk_id)}_{shard}")
+
 
 class Cell:
     """Backend-agnostic cell representation.
@@ -76,6 +84,8 @@ class SimpleClient(ABC):
     default_client_info = None
     # A client reading only its own table refuses a fork's: its older rows live upstream.
     opens_forks = False
+    # The fork marker of the open table; None for a plain table.
+    marker = None
 
     def __init_subclass__(cls, **kwargs):
         """Register a backend that declares its own ``backend_name``; an incomplete one fails."""
@@ -312,7 +322,7 @@ class SimpleClient(ABC):
         row = self._read_byte_row(attributes.TableMeta.key)
         if attributes.TableMeta.Fork in row and not self.opens_forks:
             raise exceptions.ForkTableError(
-                "this table is a fork; open it with kvdbclient.fork.client.open_client"
+                f"this table is a fork; {type(self).__name__} reads only its own table"
             )
         try:
             self._table_meta = row[attributes.TableMeta.Meta][0].value
@@ -660,11 +670,11 @@ class ClientWithIDGen(SimpleClient):
         self, chunk_id: basetypes.CHUNK_ID, root_chunk=False
     ) -> basetypes.NODE_ID:
         if root_chunk:
-            n_counters = np.uint64(2**8)
+            n_counters = np.uint64(COUNTER_SHARDS)
             max_value = 0
             for counter in range(n_counters):
                 row = self._read_byte_row(
-                    serialize_key(f"i{pad_node_id(chunk_id)}_{counter}"),
+                    counter_shard_key(chunk_id, counter),
                     columns=attributes.Concurrency.Counter,
                 )
                 val = (
@@ -690,13 +700,13 @@ class ClientWithIDGen(SimpleClient):
     def _get_root_segment_ids_range(
         self, chunk_id: basetypes.CHUNK_ID, size: int = 1, counter: int = None
     ) -> np.ndarray:
-        n_counters = np.uint64(2**8)
+        n_counters = np.uint64(COUNTER_SHARDS)
         counter = (
             np.uint64(counter % n_counters)
             if counter
             else np.uint64(np.random.randint(0, n_counters))
         )
-        key = serialize_key(f"i{pad_node_id(chunk_id)}_{counter}")
+        key = counter_shard_key(chunk_id, counter)
         min_, max_ = self._get_ids_range(key=key, size=size)
         return np.arange(
             min_ * n_counters + counter,

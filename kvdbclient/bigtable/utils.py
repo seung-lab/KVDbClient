@@ -240,6 +240,26 @@ def get_renew_lock_filter(
     )
 
 
+def get_held_lock_renew_filter(
+    lock_column: attributes._Attribute, operation_id: np.uint64
+) -> ConditionalRowFilter:
+    """Yields cells only while `operation_id` holds the lock on a root with no NewParent.
+
+    Used with `true_case_mutations`; unlike `get_renew_lock_filter`, an empty row
+    yields nothing, so a lock is never renewed on a row nobody locked.
+    """
+    return ConditionalRowFilter(
+        predicate_filter=_exact_column_filter(attributes.Hierarchy.NewParent),
+        true_filter=BlockAllFilter(True),
+        false_filter=get_row_key_renew_lock_filter(lock_column, operation_id),
+    )
+
+
+def get_has_column_filter(column: attributes._Attribute) -> ColumnRangeFilter:
+    """Yields any cell of `column`, so a conditional write can test for one."""
+    return _exact_column_filter(column)
+
+
 def get_unlock_root_filter(lock_column, lock_expiry, operation_id) -> RowFilterChain:
     time_cutoff = datetime.now(timezone.utc) - lock_expiry
     # Comply to resolution of BigTables TimeRange
