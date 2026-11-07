@@ -1,143 +1,82 @@
 """Tests for kvdbclient.serializers"""
 
 import numpy as np
+import pytest
 
+from kvdbclient import basetypes
 from kvdbclient.serializers import (
-    _Serializer,
+    JSON,
     NumPyArray,
     NumPyValue,
-    String,
-    JSON,
     Pickle,
+    String,
     UInt64String,
-    pad_node_id,
-    serialize_uint64,
-    deserialize_uint64,
-    serialize_uint64s_to_regex,
-    serialize_key,
     deserialize_key,
+    deserialize_uint64,
+    pad_node_id,
+    serialize_key,
+    serialize_uint64,
+    serialize_uint64s_to_regex,
 )
-from kvdbclient import basetypes
+
+from helpers import node_ids
+
+NODE_ID = basetypes.NODE_ID
 
 
-class TestNumPyArray:
-    def test_roundtrip(self):
-        s = NumPyArray(dtype=basetypes.NODE_ID)
-        arr = np.array([1, 2, 3], dtype=basetypes.NODE_ID)
-        data = s.serialize(arr)
-        result = s.deserialize(data)
-        np.testing.assert_array_equal(result, arr)
-
-    def test_with_shape(self):
-        s = NumPyArray(dtype=basetypes.NODE_ID, shape=(-1, 2))
-        arr = np.array([[1, 2], [3, 4]], dtype=basetypes.NODE_ID)
-        data = s.serialize(arr)
-        result = s.deserialize(data)
-        assert result.shape == (2, 2)
-        np.testing.assert_array_equal(result, arr)
-
-    def test_with_compression(self):
-        s = NumPyArray(dtype=basetypes.NODE_ID, compression_level=3)
-        arr = np.array([1, 2, 3, 4, 5], dtype=basetypes.NODE_ID)
-        data = s.serialize(arr)
-        result = s.deserialize(data)
-        np.testing.assert_array_equal(result, arr)
-
-    def test_basetype(self):
-        s = NumPyArray(dtype=basetypes.NODE_ID)
-        assert s.basetype == basetypes.NODE_ID.type
-
-
-class TestNumPyValue:
-    def test_roundtrip(self):
-        s = NumPyValue(dtype=basetypes.NODE_ID)
-        val = np.uint64(42)
-        data = s.serialize(val)
-        result = s.deserialize(data)
-        assert result == val
+@pytest.mark.parametrize(
+    "serializer, value",
+    [
+        (NumPyArray(dtype=NODE_ID), node_ids(1, 2, 3)),
+        (NumPyArray(dtype=NODE_ID, shape=(-1, 2)), node_ids([1, 2], [3, 4])),
+        (NumPyArray(dtype=NODE_ID, compression_level=3), np.arange(5, dtype=NODE_ID)),
+        (NumPyValue(dtype=NODE_ID), np.uint64(42)),
+        (String(), "hello"),
+        (JSON(), {"key": "value", "nested": [1, 2, 3]}),
+        (Pickle(), {"complex": [1, 2], "nested": {"a": True}}),
+        (UInt64String(), np.uint64(12345)),
+    ],
+    ids=[
+        "array",
+        "shaped",
+        "compressed",
+        "value",
+        "string",
+        "json",
+        "pickle",
+        "uint64",
+    ],
+)
+def test_a_value_roundtrips(serializer, value):
+    np.testing.assert_equal(serializer.deserialize(serializer.serialize(value)), value)
 
 
-class TestString:
-    def test_roundtrip(self):
-        s = String()
-        data = s.serialize("hello")
-        assert s.deserialize(data) == "hello"
+def test_an_array_serializer_names_its_dtype_as_basetype():
+    assert NumPyArray(dtype=NODE_ID).basetype == NODE_ID.type
 
 
-class TestJSON:
-    def test_roundtrip(self):
-        s = JSON()
-        obj = {"key": "value", "nested": [1, 2, 3]}
-        data = s.serialize(obj)
-        assert s.deserialize(data) == obj
-
-
-class TestPickle:
-    def test_roundtrip(self):
-        s = Pickle()
-        obj = {"complex": [1, 2], "nested": {"a": True}}
-        data = s.serialize(obj)
-        assert s.deserialize(data) == obj
-
-
-class TestUInt64String:
-    def test_roundtrip(self):
-        s = UInt64String()
-        val = np.uint64(12345)
-        data = s.serialize(val)
-        result = s.deserialize(data)
-        assert result == val
-
-
-class TestPadNodeId:
-    def test_padding(self):
-        result = pad_node_id(np.uint64(42))
-        assert len(result) == 20
-        assert result == "00000000000000000042"
-
-    def test_large_id(self):
-        result = pad_node_id(np.uint64(12345678901234567890))
-        assert len(result) == 20
+@pytest.mark.parametrize("node_id", [np.uint64(42), np.uint64(12345678901234567890)])
+def test_node_ids_pad_to_twenty_digits(node_id):
+    assert pad_node_id(node_id) == f"{int(node_id):020d}"
 
 
 class TestSerializeUint64:
-    def test_default(self):
-        result = serialize_uint64(np.uint64(42))
-        assert isinstance(result, bytes)
-        assert b"00000000000000000042" in result
+    def test_a_node_key_holds_its_padded_id(self):
+        assert b"00000000000000000042" in serialize_uint64(np.uint64(42))
 
-    def test_counter(self):
-        result = serialize_uint64(np.uint64(42), counter=True)
-        assert result.startswith(b"i")
+    @pytest.mark.parametrize("flag, prefix", [("counter", b"i"), ("fake_edges", b"f")])
+    def test_a_flag_prefixes_the_key(self, flag, prefix):
+        assert serialize_uint64(np.uint64(42), **{flag: True}).startswith(prefix)
 
-    def test_fake_edges(self):
-        result = serialize_uint64(np.uint64(42), fake_edges=True)
-        assert result.startswith(b"f")
-
-
-class TestDeserializeUint64:
-    def test_default(self):
-        serialized = serialize_uint64(np.uint64(42))
-        result = deserialize_uint64(serialized)
-        assert result == np.uint64(42)
-
-    def test_fake_edges(self):
-        serialized = serialize_uint64(np.uint64(42), fake_edges=True)
-        result = deserialize_uint64(serialized, fake_edges=True)
-        assert result == np.uint64(42)
+    @pytest.mark.parametrize("fake_edges", [False, True])
+    def test_a_key_roundtrips(self, fake_edges):
+        key = serialize_uint64(np.uint64(42), fake_edges=fake_edges)
+        assert deserialize_uint64(key, fake_edges=fake_edges) == np.uint64(42)
 
 
-class TestSerializeUint64sToRegex:
-    def test_multiple_ids(self):
-        ids = [np.uint64(1), np.uint64(2)]
-        result = serialize_uint64s_to_regex(ids)
-        assert isinstance(result, bytes)
-        assert b"|" in result
+def test_several_ids_join_into_one_regex():
+    assert b"|" in serialize_uint64s_to_regex([np.uint64(1), np.uint64(2)])
 
 
-class TestSerializeKey:
-    def test_roundtrip(self):
-        key = "test_key_123"
-        serialized = serialize_key(key)
-        assert isinstance(serialized, bytes)
-        assert deserialize_key(serialized) == key
+def test_a_string_key_roundtrips():
+    assert deserialize_key(serialize_key("test_key_123")) == "test_key_123"

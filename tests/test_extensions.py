@@ -6,8 +6,9 @@ import numpy as np
 import pytest
 
 from kvdbclient import attributes
-from kvdbclient import basetypes
 
+from helpers import SMALL_BATCH
+from helpers import node_ids
 from helpers import write_node
 
 # ── is_latest_roots ───────────────────────────────────────────────────────
@@ -17,18 +18,15 @@ EDITED = CREATED + timedelta(days=2)
 OLD_ROOT, NEW_ROOT, NO_ROW = 100, 200, 300
 
 
-@pytest.fixture(params=["bt_client", "bt_client_small_batch", "hbase_client"])
-def edited_client(request):
+@pytest.fixture(params=[None, SMALL_BATCH], ids=["one_read", "batched_reads"])
+def edited_client(request, backend):
     """`OLD_ROOT` exists from `CREATED` and is replaced by `NEW_ROOT` at `EDITED`."""
-    client = request.getfixturevalue(request.param)
-    children = np.array([1], dtype=basetypes.NODE_ID)
+    client = backend.client(max_row_key_count=request.param)
+    children = node_ids(1)
     write_node(client, OLD_ROOT, {attributes.Hierarchy.Child: children}, CREATED)
     write_node(client, NEW_ROOT, {attributes.Hierarchy.Child: children}, EDITED)
     write_node(
-        client,
-        OLD_ROOT,
-        {attributes.Hierarchy.NewParent: np.array([NEW_ROOT], dtype=basetypes.NODE_ID)},
-        EDITED,
+        client, OLD_ROOT, {attributes.Hierarchy.NewParent: node_ids(NEW_ROOT)}, EDITED
     )
     return client
 

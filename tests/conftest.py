@@ -1,119 +1,63 @@
+# pylint: disable=missing-docstring, redefined-outer-name
 import uuid
 from datetime import timedelta
+from typing import NamedTuple
 
 import pytest
 
-from kvdbclient.bigtable import BigTableConfig
-from kvdbclient.bigtable.client import Client
-from kvdbclient.hbase import HBaseConfig
-from kvdbclient.hbase.client import Client as HBaseClient
-from kvdbclient_testing.bigtable.harness import bigtable_emulator as _bigtable_emulator
-from kvdbclient_testing.hbase.mock_server import start_hbase_mock_server
+from kvdbclient import get_client_class
+from kvdbclient import get_config_class
+from kvdbclient_testing import backends
 
-EMULATOR_PROJECT = "test-project"
-EMULATOR_INSTANCE = "test-instance"
+from helpers import SMALL_BATCH
+from helpers import TEST_META
+from helpers import TEST_VERSION
 
-
-# ── BigTable fixtures ────────────────────────────────────────────────────
+_HARNESSES = {harness.name: harness for harness in backends()}
 
 
-@pytest.fixture(scope="session")
-def bigtable_emulator():
-    """Start the BigTable emulator or reuse one already running (CI)."""
-    with _bigtable_emulator() as host_port:
-        yield host_port
+class Backend(NamedTuple):
+    name: str
+    config: object
+
+    def client(self, create_table=True, max_row_key_count=None, **options):
+        config = self.config
+        if max_row_key_count is not None:
+            config = config._replace(MAX_ROW_KEY_COUNT=max_row_key_count)
+        table_id = f"test_{uuid.uuid4().hex[:12]}"
+        client = get_client_class(self.name)(
+            table_id=table_id, config=config, **options
+        )
+        if create_table:
+            client.create_table(meta=TEST_META, version=TEST_VERSION)
+        return client
 
 
-@pytest.fixture(scope="session")
-def bt_config(bigtable_emulator):
-    return BigTableConfig(
-        PROJECT=EMULATOR_PROJECT,
-        INSTANCE=EMULATOR_INSTANCE,
-        ADMIN=True,
-        READ_ONLY=False,
-        CREDENTIALS=None,
-    )
+@pytest.fixture(scope="session", params=sorted(_HARNESSES))
+def backend(request):
+    harness = _HARNESSES[request.param]
+    if not harness.available():
+        pytest.skip(f"no local {request.param} instance can start here")
+    with harness.server() as handle:
+        info = harness.backend_client(handle)
+        yield Backend(request.param, get_config_class(request.param)(**info["CONFIG"]))
 
 
-@pytest.fixture()
-def bt_client(bt_config):
-    """Client with a fresh table already created."""
-    table_id = f"test_{uuid.uuid4().hex[:12]}"
-    client = Client(table_id=table_id, config=bt_config)
-    client.create_table(meta={"test": True}, version="0.0.1")
-    yield client
+@pytest.fixture
+def client(backend):
+    return backend.client()
 
 
-@pytest.fixture()
-def bt_client_no_table(bt_config):
-    """Client bound to a table that does not yet exist."""
-    table_id = f"test_{uuid.uuid4().hex[:12]}"
-    client = Client(table_id=table_id, config=bt_config)
-    yield client
+@pytest.fixture
+def client_no_table(backend):
+    return backend.client(create_table=False)
 
 
-@pytest.fixture()
-def bt_client_small_batch(bigtable_emulator):
-    """Client with small MAX_ROW_KEY_COUNT to trigger sharded reads."""
-    config = BigTableConfig(
-        PROJECT=EMULATOR_PROJECT,
-        INSTANCE=EMULATOR_INSTANCE,
-        ADMIN=True,
-        READ_ONLY=False,
-        CREDENTIALS=None,
-        MAX_ROW_KEY_COUNT=50,
-    )
-    table_id = f"test_{uuid.uuid4().hex[:12]}"
-    client = Client(table_id=table_id, config=config)
-    client.create_table(meta={"test": True}, version="0.0.1")
-    yield client
+@pytest.fixture
+def client_short_expiry(backend):
+    return backend.client(lock_expiry=timedelta(seconds=1))
 
 
-# ── HBase fixtures ───────────────────────────────────────────────────────
-
-
-@pytest.fixture(scope="session")
-def hbase_server():
-    _data, server, port = start_hbase_mock_server()
-    yield f"http://127.0.0.1:{port}"
-    server.shutdown()
-
-
-@pytest.fixture(scope="session")
-def hbase_config(hbase_server):
-    return HBaseConfig(BASE_URL=hbase_server)
-
-
-@pytest.fixture()
-def hbase_client(hbase_config):
-    table_id = f"test_{uuid.uuid4().hex[:12]}"
-    client = HBaseClient(table_id=table_id, config=hbase_config)
-    client.create_table(meta={"test": True}, version="0.0.1")
-    yield client
-
-
-@pytest.fixture()
-def hbase_client_no_table(hbase_config):
-    table_id = f"test_{uuid.uuid4().hex[:12]}"
-    client = HBaseClient(table_id=table_id, config=hbase_config)
-    yield client
-
-
-@pytest.fixture()
-def hbase_client_short_expiry(hbase_config):
-    table_id = f"test_{uuid.uuid4().hex[:12]}"
-    client = HBaseClient(
-        table_id=table_id, config=hbase_config, lock_expiry=timedelta(seconds=1)
-    )
-    client.create_table(meta={"test": True}, version="0.0.1")
-    yield client
-
-
-@pytest.fixture()
-def bt_client_short_expiry(bt_config):
-    table_id = f"test_{uuid.uuid4().hex[:12]}"
-    client = Client(
-        table_id=table_id, config=bt_config, lock_expiry=timedelta(seconds=1)
-    )
-    client.create_table(meta={"test": True}, version="0.0.1")
-    yield client
+@pytest.fixture
+def client_small_batch(backend):
+    return backend.client(max_row_key_count=SMALL_BATCH)

@@ -5,6 +5,7 @@ import datetime
 import pytz
 import pytest
 
+from kvdbclient.base import SimpleClient
 from kvdbclient.utils import (
     get_max_time,
     get_min_time,
@@ -47,20 +48,20 @@ class TestGetValidTimestamp:
         assert result.tzinfo is not None
 
 
+@pytest.mark.parametrize(
+    "rounding",
+    [get_compatible_time_stamp, SimpleClient.get_compatible_timestamp],
+    ids=["function", "client"],
+)
 class TestCompatibleTimestamp:
-    def test_round_down(self):
+    def test_round_down(self, rounding):
         ts = datetime.datetime(2023, 6, 15, 12, 0, 0, 1500)
-        result = get_compatible_time_stamp(ts, round_up=False)
-        assert result.microsecond % 1000 == 0
-        assert result.microsecond == 1000
+        assert rounding(ts, round_up=False).microsecond == 1000
 
-    def test_round_up(self):
+    def test_round_up(self, rounding):
         ts = datetime.datetime(2023, 6, 15, 12, 0, 0, 1500)
-        result = get_compatible_time_stamp(ts, round_up=True)
-        assert result.microsecond % 1000 == 0
-        assert result.microsecond == 2000
+        assert rounding(ts, round_up=True).microsecond == 2000
 
-    def test_exact_no_change(self):
+    def test_exact_no_change(self, rounding):
         ts = datetime.datetime(2023, 6, 15, 12, 0, 0, 3000)
-        result = get_compatible_time_stamp(ts)
-        assert result == ts
+        assert rounding(ts) == ts

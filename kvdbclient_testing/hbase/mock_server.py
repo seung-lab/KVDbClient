@@ -12,6 +12,7 @@ import threading
 import time
 import uuid
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
+from typing import NamedTuple
 from urllib.parse import urlparse, parse_qs
 
 # ---------------------------------------------------------------------------
@@ -33,7 +34,8 @@ class HBaseMockData:
 
     def __init__(self):
         self.lock = threading.Lock()
-        # tables[table_name][row_key: bytes][col_spec: str] = [(value: bytes, ts_ms: int), ...]
+        # tables[table_name][row_key: bytes][col_spec: str]
+        #     = [(value: bytes, ts_ms: int), ...]
         self.tables: dict = {}
         self.table_schemas: dict = {}
         self.scanners: dict = {}
@@ -57,7 +59,7 @@ def _now_ms() -> int:
     return int(time.time() * 1000)
 
 
-def _insert_cell(cell_list: list, value: bytes, ts_ms: int):
+def _insert_cell(cell_list: list[tuple[bytes, int]], value: bytes, ts_ms: int):
     """Insert (value, ts_ms) keeping descending ts order."""
     entry = (value, ts_ms)
     for i, (_, t) in enumerate(cell_list):
@@ -65,6 +67,33 @@ def _insert_cell(cell_list: list, value: bytes, ts_ms: int):
             cell_list.insert(i, entry)
             return
     cell_list.append(entry)
+
+
+class _RestCell(NamedTuple):
+    """A request's CellSet cell: its column spec, value, and write time in ms."""
+
+    column: str
+    value: bytes
+    timestamp: int
+
+    @classmethod
+    def parse(cls, cell):
+        return cls(
+            column=_b64dec(cell["column"]).decode("utf-8"),
+            value=_b64dec(cell["$"]),
+            timestamp=cell.get("timestamp", _now_ms()),
+        )
+
+    def put_into(self, row) -> None:
+        _insert_cell(row.setdefault(self.column, []), self.value, self.timestamp)
+
+
+def _prune(table, row_key, row, column) -> None:
+    """Drops `column` from `row` once it has no versions, then `row` once empty."""
+    if not row.get(column):
+        row.pop(column, None)
+    if not row:
+        table.pop(row_key, None)
 
 
 # ---------------------------------------------------------------------------
@@ -98,34 +127,26 @@ def _make_handler_class(data: HBaseMockData):
             raw = self._read_body()
             return json.loads(raw) if raw else {}
 
-        def _send_json(self, obj, code=200):
-            body = json.dumps(obj).encode()
+        def _send(self, code=200, body=b"", content_type=None, headers=()):
             self.send_response(code)
-            self.send_header("Content-Type", "application/json")
+            if content_type:
+                self.send_header("Content-Type", content_type)
+            for name, value in headers:
+                self.send_header(name, value)
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
-            self.wfile.write(body)
+            if body:
+                self.wfile.write(body)
 
-        def _send_empty(self, code=200):
-            self.send_response(code)
-            self.send_header("Content-Length", "0")
-            self.end_headers()
-
-        def _send_bytes(
-            self, raw: bytes, code=200, content_type="application/octet-stream"
-        ):
-            self.send_response(code)
-            self.send_header("Content-Type", content_type)
-            self.send_header("Content-Length", str(len(raw)))
-            self.end_headers()
-            self.wfile.write(raw)
+        def _send_json(self, obj, code=200):
+            self._send(code, json.dumps(obj).encode(), "application/json")
 
         # -- GET ------------------------------------------------------------
 
         def do_GET(self):
             parts, query = self._parse()
             if len(parts) < 2:
-                return self._send_empty(404)
+                return self._send(404)
 
             table = parts[0]
 
@@ -134,7 +155,7 @@ def _make_handler_class(data: HBaseMockData):
                 with data.lock:
                     if table in data.table_schemas:
                         return self._send_json(data.table_schemas[table])
-                return self._send_empty(404)
+                return self._send(404)
 
             # GET /{table}/scanner/{id}
             if parts[1] == "scanner" and len(parts) >= 3:
@@ -142,9 +163,9 @@ def _make_handler_class(data: HBaseMockData):
                 with data.lock:
                     sc = data.scanners.get(scanner_id)
                     if sc is None:
-                        return self._send_empty(404)
+                        return self._send(404)
                     if sc.position >= len(sc.rows):
-                        return self._send_empty(204)
+                        return self._send(204)
                     end = sc.position + sc.batch_size
                     batch = sc.rows[sc.position : end]
                     sc.position = end
@@ -160,13 +181,13 @@ def _make_handler_class(data: HBaseMockData):
             with data.lock:
                 tbl = data.tables.get(table)
                 if tbl is None or row_key not in tbl:
-                    return self._send_empty(404)
+                    return self._send(404)
                 row_data = tbl[row_key]
                 cells = self._filter_cells(
                     row_data, col_specs, ts_from, ts_to, max_versions
                 )
                 if not cells:
-                    return self._send_empty(404)
+                    return self._send(404)
             return self._send_json(self._rows_to_cellset([(row_key, cells)]))
 
         # -- PUT ------------------------------------------------------------
@@ -174,7 +195,7 @@ def _make_handler_class(data: HBaseMockData):
         def do_PUT(self):
             parts, query = self._parse()
             if len(parts) < 2:
-                return self._send_empty(400)
+                return self._send(400)
 
             table = parts[0]
 
@@ -184,7 +205,7 @@ def _make_handler_class(data: HBaseMockData):
                 with data.lock:
                     data.table_schemas[table] = body
                     data.tables.setdefault(table, {})
-                return self._send_empty(200)
+                return self._send()
 
             # PUT /{table}/scanner
             if parts[1] == "scanner":
@@ -202,22 +223,17 @@ def _make_handler_class(data: HBaseMockData):
             with data.lock:
                 tbl = data.tables.setdefault(table, {})
                 for row in body.get("Row", []):
-                    rk = _b64dec(row["key"])
-                    row_dict = tbl.setdefault(rk, {})
+                    row_dict = tbl.setdefault(_b64dec(row["key"]), {})
                     for cell in row.get("Cell", []):
-                        col = _b64dec(cell["column"]).decode("utf-8")
-                        val = _b64dec(cell["$"])
-                        ts = cell.get("timestamp", _now_ms())
-                        cell_list = row_dict.setdefault(col, [])
-                        _insert_cell(cell_list, val, ts)
-            return self._send_empty(200)
+                        _RestCell.parse(cell).put_into(row_dict)
+            return self._send()
 
         # -- POST (atomic increment) ---------------------------------------
 
         def do_POST(self):
             parts, _ = self._parse()
             if len(parts) < 3:
-                return self._send_empty(400)
+                return self._send(400)
             table = parts[0]
             row_key = _b64dec(parts[1])
             col_spec = parts[2]
@@ -249,14 +265,14 @@ def _make_handler_class(data: HBaseMockData):
                 new_list = [(new_bytes, ts)]
                 row_dict[col_spec] = new_list
 
-            return self._send_bytes(new_bytes)
+            return self._send(200, new_bytes, "application/octet-stream")
 
         # -- DELETE ---------------------------------------------------------
 
         def do_DELETE(self):
             parts, _ = self._parse()
             if len(parts) < 2:
-                return self._send_empty(400)
+                return self._send(400)
 
             table = parts[0]
 
@@ -265,44 +281,40 @@ def _make_handler_class(data: HBaseMockData):
                 with data.lock:
                     data.tables.pop(table, None)
                     data.table_schemas.pop(table, None)
-                return self._send_empty(200)
+                return self._send()
 
             # DELETE /{table}/scanner/{id}
             if parts[1] == "scanner" and len(parts) >= 3:
                 with data.lock:
                     data.scanners.pop(parts[2], None)
-                return self._send_empty(200)
+                return self._send()
 
             row_key = _b64dec(parts[1])
 
             with data.lock:
                 tbl = data.tables.get(table)
                 if tbl is None:
-                    return self._send_empty(200)
+                    return self._send()
 
                 if len(parts) == 2:
                     # DELETE row
                     tbl.pop(row_key, None)
-                elif len(parts) == 3:
-                    # DELETE column
+                else:
                     col_spec = parts[2]
                     row_dict = tbl.get(row_key, {})
-                    row_dict.pop(col_spec, None)
-                    if not row_dict:
-                        tbl.pop(row_key, None)
-                elif len(parts) >= 4:
-                    # DELETE cell version
-                    col_spec = parts[2]
-                    ts_ms = int(parts[3])
-                    row_dict = tbl.get(row_key, {})
-                    cell_list = row_dict.get(col_spec, [])
-                    row_dict[col_spec] = [(v, t) for v, t in cell_list if t != ts_ms]
-                    if not row_dict.get(col_spec):
+                    if len(parts) == 3:
+                        # DELETE column
                         row_dict.pop(col_spec, None)
-                    if not row_dict:
-                        tbl.pop(row_key, None)
+                    else:
+                        # DELETE cell version
+                        ts_ms = int(parts[3])
+                        cell_list = row_dict.get(col_spec, [])
+                        row_dict[col_spec] = [
+                            (v, t) for v, t in cell_list if t != ts_ms
+                        ]
+                    _prune(tbl, row_key, row_dict, col_spec)
 
-            return self._send_empty(200)
+            return self._send()
 
         # -- Scanner --------------------------------------------------------
 
@@ -335,19 +347,18 @@ def _make_handler_class(data: HBaseMockData):
 
             host, port = self.server.server_address
             loc = f"http://{host}:{port}/{table}/scanner/{scanner_id}"
-            self.send_response(201)
-            self.send_header("Location", loc)
-            self.send_header("Content-Length", "0")
-            self.end_headers()
+            self._send(201, headers=[("Location", loc)])
 
-        # -- Check-and-put --------------------------------------------------
+        # -- Check-and-put and check-and-delete -----------------------------
+
+        def _check_request(self, parts):
+            """The row key, checked column spec and cells of a check request."""
+            body = self._json_body()
+            cells = body.get("Row", [{}])[0].get("Cell", [])
+            return _b64dec(parts[1]), parts[2], cells
 
         def _handle_check_and_put(self, table, parts, query):
-            body = self._json_body()
-            row_key = _b64dec(parts[1])
-            check_col_spec = parts[2]  # the column to check
-
-            row_cells = body.get("Row", [{}])[0].get("Cell", [])
+            row_key, check_col_spec, row_cells = self._check_request(parts)
 
             if len(row_cells) >= 2:
                 # First cell is the check cell, second is the put cell
@@ -360,37 +371,23 @@ def _make_handler_class(data: HBaseMockData):
 
             with data.lock:
                 tbl = data.tables.setdefault(table, {})
-                row_dict = tbl.get(row_key, {})
-                current_cells = row_dict.get(check_col_spec, [])
+                current_cells = tbl.get(row_key, {}).get(check_col_spec, [])
 
                 if check_value is None:
                     # Column must not exist
                     if current_cells:
-                        return self._send_empty(304)
-                else:
+                        return self._send(304)
+                elif not current_cells or current_cells[0][0] != check_value:
                     # Latest value must match
-                    if not current_cells or current_cells[0][0] != check_value:
-                        return self._send_empty(304)
+                    return self._send(304)
 
-                # Condition met - apply the put
                 if put_cell:
-                    put_col = _b64dec(put_cell["column"]).decode("utf-8")
-                    put_val = _b64dec(put_cell["$"])
-                    put_ts = put_cell.get("timestamp", _now_ms())
-                    row_dict = tbl.setdefault(row_key, {})
-                    cell_list = row_dict.setdefault(put_col, [])
-                    _insert_cell(cell_list, put_val, put_ts)
+                    _RestCell.parse(put_cell).put_into(tbl.setdefault(row_key, {}))
 
-            return self._send_empty(200)
-
-        # -- Check-and-delete -----------------------------------------------
+            return self._send()
 
         def _handle_check_and_delete(self, table, parts, query):
-            body = self._json_body()
-            row_key = _b64dec(parts[1])
-            check_col_spec = parts[2]
-
-            row_cells = body.get("Row", [{}])[0].get("Cell", [])
+            row_key, check_col_spec, row_cells = self._check_request(parts)
             check_value = _b64dec(row_cells[0]["$"]) if row_cells else None
 
             with data.lock:
@@ -399,14 +396,12 @@ def _make_handler_class(data: HBaseMockData):
                 current_cells = row_dict.get(check_col_spec, [])
 
                 if not current_cells or current_cells[0][0] != check_value:
-                    return self._send_empty(304)
+                    return self._send(304)
 
-                # Match - delete the column
                 row_dict.pop(check_col_spec, None)
-                if not row_dict:
-                    tbl.pop(row_key, None)
+                _prune(tbl, row_key, row_dict, check_col_spec)
 
-            return self._send_empty(200)
+            return self._send()
 
         # -- Utility --------------------------------------------------------
 
