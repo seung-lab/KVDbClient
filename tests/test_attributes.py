@@ -5,38 +5,37 @@ import pytest
 
 from kvdbclient.attributes import (
     _Attribute,
-    _AttributeArray,
     Concurrency,
     Connectivity,
     Hierarchy,
-    TableMeta,
-    TableVersion,
     OperationLogs,
     from_key,
 )
 from kvdbclient import basetypes
 
+from helpers import node_ids
+
+
+@pytest.mark.parametrize(
+    "column, value",
+    [
+        (Hierarchy.Child, node_ids(1, 2, 3)),
+        (OperationLogs.UserID, "test_user"),
+        (Connectivity.CrossChunkEdge, node_ids([1, 2], [3, 4])),
+    ],
+    ids=["array", "string", "edge_array"],
+)
+def test_a_column_value_roundtrips(column, value):
+    np.testing.assert_equal(column.deserialize(column.serialize(value)), value)
+
 
 class TestAttribute:
-    def test_serialize_deserialize_numpy(self):
-        attr = Hierarchy.Child
-        arr = np.array([1, 2, 3], dtype=basetypes.NODE_ID)
-        data = attr.serialize(arr)
-        result = attr.deserialize(data)
-        np.testing.assert_array_equal(result, arr)
-
-    def test_serialize_deserialize_string(self):
-        attr = OperationLogs.UserID
-        data = attr.serialize("test_user")
-        assert attr.deserialize(data) == "test_user"
-
     def test_basetype(self):
         assert Hierarchy.Child.basetype == basetypes.NODE_ID.type
         assert OperationLogs.UserID.basetype == str
 
     def test_index(self):
-        attr = Connectivity.CrossChunkEdge[5]
-        assert attr.index == 5
+        assert Connectivity.CrossChunkEdge[5].index == 5
 
     def test_family_id(self):
         assert Hierarchy.Child.family_id == "0"
@@ -53,17 +52,10 @@ class TestAttributeArray:
     def test_pattern(self):
         assert Connectivity.CrossChunkEdge.pattern == b"cross_edges_%d"
 
-    def test_serialize_deserialize(self):
-        arr = np.array([[1, 2], [3, 4]], dtype=basetypes.NODE_ID)
-        data = Connectivity.CrossChunkEdge.serialize(arr)
-        result = Connectivity.CrossChunkEdge.deserialize(data)
-        np.testing.assert_array_equal(result, arr)
-
 
 class TestFromKey:
     def test_valid_key(self):
-        result = from_key("0", b"children")
-        assert result is Hierarchy.Child
+        assert from_key("0", b"children") is Hierarchy.Child
 
     def test_invalid_key_raises(self):
         with pytest.raises(KeyError, match="Unknown key"):
