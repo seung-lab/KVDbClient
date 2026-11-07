@@ -1,10 +1,10 @@
-# pylint: disable=invalid-name, missing-docstring, line-too-long, logging-fstring-interpolation, too-many-arguments
+# pylint: disable=invalid-name, missing-docstring, line-too-long
+# pylint: disable=logging-fstring-interpolation, too-many-arguments
 
 import atexit
 import typing
 import logging
 import weakref
-from collections import defaultdict
 from datetime import datetime
 from datetime import timedelta
 
@@ -32,12 +32,18 @@ from . import get_client_info
 from ..base import Cell
 from ..base import ClientWithIDGen
 from ..base import ColumnFamilyConfig
-from ..base import DEFAULT_COLUMN_FAMILIES
+from ..base import LegacyRow
+from ..base import LegacyRows
 from ..base import OperationLogger
+from ..base import column_view
+from ..base import deserialize_cells
+from ..base import log_lock_holders
 from .. import attributes
 from .. import exceptions
 from ..serializers import serialize_uint64
 from ..utils import get_valid_timestamp
+
+CHECK_AND_MUTATE_TIMEOUT_S = 30.0
 
 
 def _datetime_to_micros(dt: datetime) -> int:
@@ -45,44 +51,65 @@ def _datetime_to_micros(dt: datetime) -> int:
     return int(dt.timestamp() * 1_000_000)
 
 
-class _CompatibleRow:
-    """Wraps a new-API Row to mimic legacy PartialRowData.
-
-    Provides ``.cells`` as ``{family_str: {qualifier_bytes: [Cell, ...]}}``.
-    """
-
-    __slots__ = ("cells",)
-
-    def __init__(self, row):
-        families = defaultdict(lambda: defaultdict(list))
-        for cell in row.cells:
-            qual = (
-                cell.qualifier
-                if isinstance(cell.qualifier, bytes)
-                else cell.qualifier.encode()
-            )
-            families[cell.family][qual].append(
-                Cell(value=cell.value, timestamp=cell.timestamp_micros)
-            )
-        self.cells = dict(families)
-
-    def __eq__(self, other):
-        if not isinstance(other, _CompatibleRow):
-            return NotImplemented
-        return self.cells == other.cells
-
-    def __hash__(self):
-        return id(self)
+def _set_cell(column: attributes._Attribute, value, timestamp_micros) -> SetCell:
+    """SetCell of `value` in `column`, at `timestamp_micros`, or server time for None."""
+    return SetCell(
+        family=column.family_id,
+        qualifier=column.key,
+        new_value=column.serialize(value),
+        timestamp_micros=timestamp_micros,
+    )
 
 
-class _ReadAllRowsResult:
-    """Wrapper for read_all_rows result, compatible with legacy RowIterator API."""
+def _set_lock_mutation(
+    lock_column: attributes._Attribute, operation_id: np.uint64
+) -> SetCell:
+    """SetCell of `operation_id` in `lock_column`, stamped now to the millisecond."""
+    return _set_cell(
+        lock_column, operation_id, _datetime_to_micros(get_valid_timestamp(None))
+    )
 
-    def __init__(self, rows_list):
-        self.rows = {row.row_key: _CompatibleRow(row) for row in rows_list}
 
-    def consume_all(self):
+def _delete_range(
+    column: attributes._Attribute, start_micros=None, end_micros=None
+) -> DeleteRangeFromColumn:
+    """Deletes `column`'s cells from `start_micros` until `end_micros`; None is open."""
+    return DeleteRangeFromColumn(
+        family=column.family_id,
+        qualifier=column.key,
+        start_timestamp_micros=start_micros,
+        end_timestamp_micros=end_micros,
+    )
+
+
+def _client_kwargs(config: BigTableConfig, **extra) -> dict[str, object]:
+    """A client's keywords for `config`'s project, with its credentials when set."""
+    kwargs = dict(project=config.PROJECT, **extra)
+    if config.CREDENTIALS:
+        kwargs["credentials"] = config.CREDENTIALS
+    return kwargs
+
+
+def _close_quietly(data_client) -> None:
+    """Closes `data_client`, ignoring one already closed or broken."""
+    try:
+        data_client.close()
+    except Exception:
         pass
+
+
+def _gc_rule(column_family: ColumnFamilyConfig):
+    """`column_family`'s garbage-collection rule, or None when it keeps every cell."""
+    rules = []
+    if column_family.max_versions is not None:
+        rules.append(MaxVersionsGCRule(column_family.max_versions))
+    if column_family.max_age is not None:
+        rules.append(MaxAgeGCRule(column_family.max_age))
+    if not rules:
+        return None
+    if len(rules) == 1:
+        return rules[0]
+    return GCRuleIntersection(rules)
 
 
 class Client(ClientWithIDGen, OperationLogger):
@@ -106,10 +133,7 @@ class Client(ClientWithIDGen, OperationLogger):
         self.__admin_table = None
 
         # Data client (new — all read/write/lock operations)
-        data_kwargs = dict(project=config.PROJECT)
-        if config.CREDENTIALS:
-            data_kwargs["credentials"] = config.CREDENTIALS
-        self._data_client = BigtableDataClient(**data_kwargs)
+        self._data_client = BigtableDataClient(**_client_kwargs(config))
         self._table = self._data_client.get_table(
             config.INSTANCE,
             table_id,
@@ -123,7 +147,7 @@ class Client(ClientWithIDGen, OperationLogger):
             ),
             default_mutate_rows_operation_timeout=lock_expiry.total_seconds(),
             default_mutate_rows_attempt_timeout=60.0,
-            # Single-row ops (lock/unlock/increment)
+            # Single-row ops; lock compare-and-sets pass CHECK_AND_MUTATE_TIMEOUT_S
             default_operation_timeout=60.0,
             default_attempt_timeout=20.0,
             default_retryable_errors=(DeadlineExceeded, ServiceUnavailable),
@@ -135,62 +159,31 @@ class Client(ClientWithIDGen, OperationLogger):
             lock_expiry=lock_expiry,
             max_row_key_count=config.MAX_ROW_KEY_COUNT,
         )
-        self._finalizer = weakref.finalize(self, Client._shutdown, self._data_client)
+        self._finalizer = weakref.finalize(self, _close_quietly, self._data_client)
         atexit.register(self._finalizer)
 
     def close(self):
         self._finalizer()
 
-    @staticmethod
-    def _shutdown(data_client):
-        try:
-            data_client.close()
-        except Exception:
-            pass
-
     @property
     def _admin_table(self):
         if self.__admin_table is None:
-            admin_kwargs = dict(project=self._config.PROJECT, admin=self._config.ADMIN)
-            if self._config.CREDENTIALS:
-                admin_kwargs["credentials"] = self._config.CREDENTIALS
-            admin_client = bigtable.Client(**admin_kwargs)
-            instance = admin_client.instance(self._config.INSTANCE)
+            kwargs = _client_kwargs(self._config, admin=self._config.ADMIN)
+            instance = bigtable.Client(**kwargs).instance(self._config.INSTANCE)
             self.__admin_table = instance.table(self._table_id)
         return self.__admin_table
 
-    @staticmethod
-    def _build_gc_rule(cf):
-        rules = []
-        if cf.max_versions is not None:
-            rules.append(MaxVersionsGCRule(cf.max_versions))
-        if cf.max_age is not None:
-            rules.append(MaxAgeGCRule(cf.max_age))
-        if not rules:
-            return None
-        if len(rules) == 1:
-            return rules[0]
-        return GCRuleIntersection(rules)
+    def _table_exists(self) -> bool:
+        return self._admin_table.exists()
 
-    def _create_column_families(self, column_families=None):
-        if column_families is None:
-            column_families = DEFAULT_COLUMN_FAMILIES
-        for cf in column_families:
-            gc_rule = self._build_gc_rule(cf)
-            f = self._admin_table.column_family(cf.family_id, gc_rule=gc_rule)
-            f.create()
-
-    def create_table(self, meta, version: str, column_families=None) -> None:
-        if self._admin_table.exists():
-            raise ValueError(f"{self._admin_table.table_id} already exists.")
+    def _create_storage(self, column_families) -> None:
         self._admin_table.create()
-        self._create_column_families(column_families)
-        self.add_table_version(version)
-        self.update_table_meta(meta)
+        for column_family in column_families:
+            self.create_column_family(column_family)
 
     def create_column_family(self, family_id, gc_rule=None):
         if isinstance(family_id, ColumnFamilyConfig):
-            gc_rule = self._build_gc_rule(family_id)
+            gc_rule = _gc_rule(family_id)
             family_id = family_id.family_id
         f = self._admin_table.column_family(family_id, gc_rule=gc_rule)
         f.create()
@@ -202,16 +195,9 @@ class Client(ClientWithIDGen, OperationLogger):
         time_stamp: typing.Optional[datetime] = None,
     ) -> RowMutationEntry:
         ts_micros = _datetime_to_micros(time_stamp) if time_stamp else None
-        mutations = []
-        for column, value in val_dict.items():
-            mutations.append(
-                SetCell(
-                    family=column.family_id,
-                    qualifier=column.key,
-                    new_value=column.serialize(value),
-                    timestamp_micros=ts_micros,
-                )
-            )
+        mutations = [
+            _set_cell(column, value, ts_micros) for column, value in val_dict.items()
+        ]
         return RowMutationEntry(row_key, mutations)
 
     def _write_rows(self, rows, slow_retry=True, block_size=10000):
@@ -238,19 +224,62 @@ class Client(ClientWithIDGen, OperationLogger):
         except MutationsExceptionGroup as exc:
             raise exceptions.KVDBClientError(f"Bulk write failed: {exc}") from exc
 
-    def _set_lock_mutation(self, lock_column, operation_id: np.uint64) -> SetCell:
-        return SetCell(
-            family=lock_column.family_id,
-            qualifier=lock_column.key,
-            new_value=lock_column.serialize(operation_id),
-            timestamp_micros=_datetime_to_micros(get_valid_timestamp(None)),
+    def _check_and_mutate(
+        self, row_key: bytes, predicate: RowFilter, **case_mutations
+    ) -> bool:
+        """Mutates `row_key` by whether `predicate` matches; True when it matched.
+
+        Takes the table's `true_case_mutations` and `false_case_mutations`
+        keywords, under the one compare-and-set timeout.
+        """
+        return self._table.check_and_mutate_row(
+            row_key,
+            predicate=predicate,
+            operation_timeout=CHECK_AND_MUTATE_TIMEOUT_S,
+            **case_mutations,
         )
 
-    def _delete_lock_mutation(self, lock_column) -> DeleteRangeFromColumn:
-        return DeleteRangeFromColumn(
-            family=lock_column.family_id,
-            qualifier=lock_column.key,
+    def _set_lock_unless(
+        self,
+        row_key: bytes,
+        predicate: RowFilter,
+        lock_column: attributes._Attribute,
+        operation_id: np.uint64,
+    ) -> bool:
+        """Writes the lock cell unless `predicate` matches; True when it wrote."""
+        mutation = _set_lock_mutation(lock_column, operation_id)
+        return not self._check_and_mutate(
+            row_key, predicate, false_case_mutations=mutation
         )
+
+    def _delete_lock_if(
+        self, row_key: bytes, predicate: RowFilter, lock_column: attributes._Attribute
+    ) -> bool:
+        """Deletes `lock_column` when `predicate` matches.
+
+        Returns the table's result as is: whether `predicate` matched.
+        """
+        mutation = _delete_range(lock_column)
+        return self._check_and_mutate(row_key, predicate, true_case_mutations=mutation)
+
+    def _lock_root_unless(
+        self,
+        root_id: np.uint64,
+        predicate: RowFilter,
+        lock_column: attributes._Attribute,
+        operation_id: np.uint64,
+        log_prefix: str,
+    ) -> bool:
+        """Locks `lock_column` on `root_id` unless `predicate` matches.
+
+        True when locked. A refusal logs `log_prefix` and the holding op ids, at debug.
+        """
+        row_key = serialize_uint64(root_id)
+        acquired = self._set_lock_unless(row_key, predicate, lock_column, operation_id)
+        if not acquired and self.logger.isEnabledFor(logging.DEBUG):
+            row = self._read_byte_row(row_key, columns=lock_column)
+            log_lock_holders(self.logger, log_prefix, row)
+        return acquired
 
     def lock_root(self, root_id: np.uint64, operation_id: np.uint64) -> bool:
         lock_column = attributes.Concurrency.Lock
@@ -258,106 +287,49 @@ class Client(ClientWithIDGen, OperationLogger):
         filter_ = utils.get_root_lock_filter(
             lock_column, self._lock_expiry, indefinite_lock_column
         )
-        lock_acquired = not self._table.check_and_mutate_row(
-            serialize_uint64(root_id),
-            predicate=filter_,
-            false_case_mutations=self._set_lock_mutation(lock_column, operation_id),
-            operation_timeout=30.0,
+        return self._lock_root_unless(
+            root_id, filter_, lock_column, operation_id, "Locked"
         )
-        if not lock_acquired and self.logger.isEnabledFor(logging.DEBUG):
-            row = self._read_byte_row(serialize_uint64(root_id), columns=lock_column)
-            l_operation_ids = [cell.value for cell in row]
-            self.logger.debug(f"Locked operation ids: {l_operation_ids}")
-        return lock_acquired
 
     def lock_root_indefinitely(
         self, root_id: np.uint64, operation_id: np.uint64
     ) -> bool:
         lock_column = attributes.Concurrency.IndefiniteLock
         filter_ = utils.get_indefinite_root_lock_filter(lock_column)
-        lock_acquired = not self._table.check_and_mutate_row(
-            serialize_uint64(root_id),
-            predicate=filter_,
-            false_case_mutations=self._set_lock_mutation(lock_column, operation_id),
-            operation_timeout=30.0,
-        )
-        if not lock_acquired and self.logger.isEnabledFor(logging.DEBUG):
-            row = self._read_byte_row(serialize_uint64(root_id), columns=lock_column)
-            l_operation_ids = [cell.value for cell in row]
-            self.logger.debug(f"Indefinitely locked operation ids: {l_operation_ids}")
-        return lock_acquired
-
-    def unlock_root(self, root_id: np.uint64, operation_id: np.uint64):
-        lock_column = attributes.Concurrency.Lock
-        filter_ = utils.get_unlock_root_filter(
-            lock_column, self._lock_expiry, operation_id
-        )
-        return self._table.check_and_mutate_row(
-            serialize_uint64(root_id),
-            predicate=filter_,
-            true_case_mutations=self._delete_lock_mutation(lock_column),
-            operation_timeout=30.0,
-        )
-
-    def unlock_indefinitely_locked_root(
-        self, root_id: np.uint64, operation_id: np.uint64
-    ):
-        lock_column = attributes.Concurrency.IndefiniteLock
-        return self._table.check_and_mutate_row(
-            serialize_uint64(root_id),
-            predicate=utils.get_indefinite_unlock_root_filter(
-                lock_column, operation_id
-            ),
-            true_case_mutations=self._delete_lock_mutation(lock_column),
-            operation_timeout=30.0,
+        return self._lock_root_unless(
+            root_id, filter_, lock_column, operation_id, "Indefinitely locked"
         )
 
     def renew_lock(self, root_id: np.uint64, operation_id: np.uint64) -> bool:
         # Root-specific: ConditionalRowFilter inverts the usual renew
-        # semantics so SetCell runs as `false_case_mutations` (see
-        # `get_renew_lock_filter`). The generic `renew_lock_by_row_key`
-        # variant below uses the simpler `true_case_mutations` path.
+        # semantics, so a root renew sets the cell unless the filter matches
+        # (see `get_renew_lock_filter`); `renew_lock_by_row_key` sets it when
+        # its filter matches.
         lock_column = attributes.Concurrency.Lock
-        return not self._table.check_and_mutate_row(
-            serialize_uint64(root_id),
-            predicate=utils.get_renew_lock_filter(lock_column, operation_id),
-            false_case_mutations=self._set_lock_mutation(lock_column, operation_id),
-            operation_timeout=30.0,
-        )
+        row_key = serialize_uint64(root_id)
+        filter_ = utils.get_renew_lock_filter(lock_column, operation_id)
+        return self._set_lock_unless(row_key, filter_, lock_column, operation_id)
 
     def lock_by_row_key(self, row_key: bytes, operation_id: np.uint64) -> bool:
         lock_column = attributes.Concurrency.Lock
         filter_ = utils.get_row_key_lock_filter(lock_column, self._lock_expiry)
-        return not self._table.check_and_mutate_row(
-            row_key,
-            predicate=filter_,
-            false_case_mutations=self._set_lock_mutation(lock_column, operation_id),
-            operation_timeout=30.0,
-        )
+        return self._set_lock_unless(row_key, filter_, lock_column, operation_id)
 
     def lock_by_row_key_with_indefinite(
         self, row_key: bytes, operation_id: np.uint64
     ) -> bool:
         """Temporal lock on a row key that also refuses if indefinite is held.
 
-        Mirrors `lock_root` (which already unions both columns via
-        `get_root_lock_filter`) but for the hierarchy-free row-key
-        scheme. Required for locks we plan to upgrade to indefinite —
-        without the union, a fresh temporal acquire could silently
-        succeed against a row whose indefinite cell was left set by a
-        crashed worker.
+        `lock_root`'s filter adds the NewParent check on top of this one. Locks to be
+        upgraded to indefinite need it: without it, an acquire could succeed on a row
+        whose indefinite cell a crashed worker left set.
         """
         lock_column = attributes.Concurrency.Lock
         indefinite_lock_column = attributes.Concurrency.IndefiniteLock
         filter_ = utils.get_row_key_lock_filter_with_indefinite(
             lock_column, self._lock_expiry, indefinite_lock_column
         )
-        return not self._table.check_and_mutate_row(
-            row_key,
-            predicate=filter_,
-            false_case_mutations=self._set_lock_mutation(lock_column, operation_id),
-            operation_timeout=30.0,
-        )
+        return self._set_lock_unless(row_key, filter_, lock_column, operation_id)
 
     def lock_by_row_key_indefinitely(
         self, row_key: bytes, operation_id: np.uint64
@@ -368,62 +340,35 @@ class Client(ClientWithIDGen, OperationLogger):
         for hierarchy-free rows.
         """
         lock_column = attributes.Concurrency.IndefiniteLock
-        return not self._table.check_and_mutate_row(
-            row_key,
-            predicate=utils.get_indefinite_row_key_lock_filter(lock_column),
-            false_case_mutations=self._set_lock_mutation(lock_column, operation_id),
-            operation_timeout=30.0,
-        )
+        filter_ = utils.get_indefinite_row_key_lock_filter(lock_column)
+        return self._set_lock_unless(row_key, filter_, lock_column, operation_id)
 
     def unlock_by_row_key(self, row_key: bytes, operation_id: np.uint64):
         lock_column = attributes.Concurrency.Lock
-        # Reuses the root unlock filter: time-range + column + op_id
-        # value match — it's already hierarchy-agnostic.
-        filter_ = utils.get_unlock_root_filter(
+        filter_ = utils.get_unexpired_held_lock_filter(
             lock_column, self._lock_expiry, operation_id
         )
-        return self._table.check_and_mutate_row(
-            row_key,
-            predicate=filter_,
-            true_case_mutations=self._delete_lock_mutation(lock_column),
-            operation_timeout=30.0,
-        )
+        return self._delete_lock_if(row_key, filter_, lock_column)
 
     def unlock_indefinitely_locked_by_row_key(
         self, row_key: bytes, operation_id: np.uint64
     ):
-        """Release an indefinite row-key lock previously acquired by
-        `lock_by_row_key_indefinitely`. Deletes the cell only if its
-        value still matches `operation_id` — same safety as the root
-        variant: a crashed-then-stolen lock can't be released under the
-        current holder.
+        """Release the indefinite lock on any row, roots included, holding `operation_id`.
+
+        Deleting only a matching cell means a lock stolen after a crash cannot be released
+        under its new holder.
         """
         lock_column = attributes.Concurrency.IndefiniteLock
-        return self._table.check_and_mutate_row(
-            row_key,
-            predicate=utils.get_indefinite_unlock_root_filter(
-                lock_column, operation_id
-            ),
-            true_case_mutations=self._delete_lock_mutation(lock_column),
-            operation_timeout=30.0,
-        )
+        filter_ = utils.get_held_lock_filter(lock_column, operation_id)
+        return self._delete_lock_if(row_key, filter_, lock_column)
 
     def renew_lock_by_row_key(self, row_key: bytes, operation_id: np.uint64) -> bool:
         lock_column = attributes.Concurrency.Lock
-        filter_ = utils.get_row_key_renew_lock_filter(lock_column, operation_id)
+        filter_ = utils.get_held_lock_filter(lock_column, operation_id)
+        mutation = _set_lock_mutation(lock_column, operation_id)
         return bool(
-            self._table.check_and_mutate_row(
-                row_key,
-                predicate=filter_,
-                true_case_mutations=self._set_lock_mutation(lock_column, operation_id),
-                operation_timeout=30.0,
-            )
+            self._check_and_mutate(row_key, filter_, true_case_mutations=mutation)
         )
-
-    def get_compatible_timestamp(
-        self, time_stamp: datetime, round_up: bool = False
-    ) -> datetime:
-        return utils.get_google_compatible_time_stamp(time_stamp, round_up=round_up)
 
     def _get_ids_range(self, key: bytes, size: int) -> typing.Tuple:
         column = attributes.Concurrency.Counter
@@ -434,15 +379,6 @@ class Client(ClientWithIDGen, OperationLogger):
         cells = result_row.get_cells(column.family_id, column.key)
         high = column.deserialize(cells[0].value)
         return high + np.uint64(1) - size, high
-
-    @staticmethod
-    def _deserialize_column_dict(column_dict):
-        for column, cell_entries in column_dict.items():
-            for i, cell_entry in enumerate(cell_entries):
-                column_dict[column][i] = Cell(
-                    value=column.deserialize(cell_entry.value),
-                    timestamp=cell_entry.timestamp,
-                )
 
     def _read_byte_rows(
         self,
@@ -489,9 +425,8 @@ class Client(ClientWithIDGen, OperationLogger):
         )
 
         for row_key, column_dict in rows.items():
-            self._deserialize_column_dict(column_dict)
-            if isinstance(columns, attributes._Attribute):
-                rows[row_key] = column_dict.get(columns, [])
+            deserialize_cells(column_dict)
+            rows[row_key] = column_view(column_dict, columns)
         return rows
 
     def _read_byte_row(
@@ -510,12 +445,10 @@ class Client(ClientWithIDGen, OperationLogger):
         )
         row = self._table.read_row(row_key, row_filter=filter_)
         if row is None:
-            return [] if isinstance(columns, attributes._Attribute) else {}
+            return column_view({}, columns)
         column_dict = utils.row_to_column_dict(row)
-        self._deserialize_column_dict(column_dict)
-        if isinstance(columns, attributes._Attribute):
-            return column_dict.get(columns, [])
-        return column_dict
+        deserialize_cells(column_dict)
+        return column_view(column_dict, columns)
 
     def _read(
         self,
@@ -530,21 +463,37 @@ class Client(ClientWithIDGen, OperationLogger):
         )
         if not query.row_keys and not query.row_ranges:
             return {}
+        queries = [query]
         if row_keys and len(row_keys) > self._max_row_key_count:
-            combined = {}
-            for i in range(0, len(row_keys), self._max_row_key_count):
-                chunk_query = ReadRowsQuery(
-                    row_keys=row_keys[i : i + self._max_row_key_count],
-                    row_filter=row_filter,
-                )
-                for row in self._table.read_rows(chunk_query):
-                    combined[row.row_key] = utils.row_to_column_dict(row)
-            return combined
-        rows = self._table.read_rows(query)
-        return {row.row_key: utils.row_to_column_dict(row) for row in rows}
+            step = self._max_row_key_count
+            queries = [
+                ReadRowsQuery(row_keys=row_keys[i : i + step], row_filter=row_filter)
+                for i in range(0, len(row_keys), step)
+            ]
+        return {
+            row.row_key: utils.row_to_column_dict(row)
+            for chunk in queries
+            for row in self._table.read_rows(chunk)
+        }
 
     def read_all_rows(self):
-        return _ReadAllRowsResult(self._table.read_rows_stream(ReadRowsQuery()))
+        return LegacyRows(
+            {
+                row.row_key: LegacyRow(
+                    (
+                        cell.family,
+                        (
+                            cell.qualifier
+                            if isinstance(cell.qualifier, bytes)
+                            else cell.qualifier.encode()
+                        ),
+                        Cell(value=cell.value, timestamp=cell.timestamp_micros),
+                    )
+                    for cell in row.cells
+                )
+                for row in self._table.read_rows_stream(ReadRowsQuery())
+            }
+        )
 
     def _delete_meta(self):
         self._table.mutate_row(attributes.TableMeta.key, DeleteAllFromRow())
@@ -556,14 +505,7 @@ class Client(ClientWithIDGen, OperationLogger):
             for ts in timestamps:
                 start_us = _datetime_to_micros(ts)
                 end_us = start_us + 1000  # 1ms (bigtable granularity)
-                row_mutations.append(
-                    DeleteRangeFromColumn(
-                        family=column.family_id,
-                        qualifier=column.key,
-                        start_timestamp_micros=start_us,
-                        end_timestamp_micros=end_us,
-                    )
-                )
+                row_mutations.append(_delete_range(column, start_us, end_us))
             entries.append(RowMutationEntry(row_key, row_mutations))
         for key in row_keys_to_delete or []:
             entries.append(RowMutationEntry(key, DeleteAllFromRow()))

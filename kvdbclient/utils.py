@@ -1,6 +1,7 @@
 """Timestamp and time utilities for storage backends."""
 
 import datetime
+from typing import NamedTuple
 
 import pytz
 
@@ -27,16 +28,27 @@ def get_valid_timestamp(timestamp):
 def get_compatible_time_stamp(
     time_stamp: datetime.datetime, round_up: bool = False
 ) -> datetime.datetime:
-    """Round a datetime to millisecond precision.
+    """Round a datetime down to the millisecond, the resolution storage keeps.
 
-    Google BigTable restricts timestamp accuracy to milliseconds.
-    By default, timestamps are rounded down.
+    Rounding up lands strictly after `time_stamp`, so the result serves as an
+    exclusive upper bound that keeps the input's millisecond.
     """
     micro_s_gap = datetime.timedelta(microseconds=time_stamp.microsecond % 1000)
-    if micro_s_gap == 0:
-        return time_stamp
     if round_up:
-        time_stamp += datetime.timedelta(microseconds=1000) - micro_s_gap
-    else:
-        time_stamp -= micro_s_gap
-    return time_stamp
+        return time_stamp + (datetime.timedelta(microseconds=1000) - micro_s_gap)
+    return time_stamp - micro_s_gap
+
+
+class TimeRange(NamedTuple):
+    """A read's time bounds, each rounded to the millisecond, or None where open."""
+
+    start: datetime.datetime | None
+    end: datetime.datetime | None
+
+
+def get_compatible_time_range(start, end, end_inclusive: bool) -> TimeRange:
+    """`start` rounded down, and `end` rounded up when inclusive; None stays open."""
+    return TimeRange(
+        None if start is None else get_compatible_time_stamp(start),
+        None if end is None else get_compatible_time_stamp(end, round_up=end_inclusive),
+    )
