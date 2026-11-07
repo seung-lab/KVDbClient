@@ -1,10 +1,8 @@
 # pylint: disable=invalid-name, missing-docstring, line-too-long, too-many-arguments
 
-import base64
 import logging
 import typing
 import struct
-from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 
 import numpy as np
@@ -21,61 +19,20 @@ from . import HBaseConfig
 from . import get_client_info
 from . import utils as hbase_utils
 from ..base import (
-    Cell,
     ClientWithIDGen,
     ColumnFamilyConfig,
-    DEFAULT_COLUMN_FAMILIES,
+    LegacyRow,
+    LegacyRows,
     OperationLogger,
+    column_view,
+    deserialize_cells,
+    log_lock_holders,
 )
 from .. import attributes
 from .. import exceptions
 from ..serializers import serialize_uint64
+from ..utils import get_compatible_time_range
 from ..utils import get_valid_timestamp
-
-
-class _PartialRowAdapter:
-    """Adapts an HBase REST JSON row to mimic bigtable's ``PartialRowData``.
-
-    Provides ``.cells`` as ``{family_str: {qualifier_bytes: [Cell, ...]}}``.
-    """
-
-    __slots__ = ("cells", "_raw")
-
-    def __init__(self, raw_row):
-        families = defaultdict(lambda: defaultdict(list))
-        for cell in raw_row.get("Cell", []):
-            col_decoded = base64.b64decode(cell["column"]).decode("utf-8")
-            fam, qual = col_decoded.split(":", 1)
-            val = base64.b64decode(cell["$"])
-            ts = hbase_utils.hbase_ts_to_datetime(cell.get("timestamp"))
-            families[fam][qual.encode("utf-8")].append(Cell(value=val, timestamp=ts))
-        self.cells = dict(families)
-        self._raw = raw_row
-
-    def __eq__(self, other):
-        if not isinstance(other, _PartialRowAdapter):
-            return NotImplemented
-        return self._raw == other._raw
-
-    def __hash__(self):
-        return id(self)
-
-
-class _ConsumableRows:
-    """Thin wrapper so ``read_all_rows()`` is compatible with bigtable's
-    ``PartialRowsData`` interface (``res.consume_all()``,
-    ``key in res.rows``, ``res.rows[key].cells[family][qualifier]``)."""
-
-    __slots__ = ("rows",)
-
-    def __init__(self, raw_rows):
-        self.rows = {}
-        for row in raw_rows:
-            rk = base64.b64decode(row["key"])
-            self.rows[rk] = _PartialRowAdapter(row)
-
-    def consume_all(self):
-        pass
 
 
 class HBaseMutation:
@@ -87,9 +44,18 @@ class HBaseMutation:
         self.row_key = row_key
         self.cells = {}  # {str col_spec: (bytes value, datetime|None timestamp)}
 
-    def set_cell(self, family_id: str, column: bytes, value: bytes, timestamp=None):
-        col_spec = f"{family_id}:{column.decode()}"
-        self.cells[col_spec] = (value, timestamp)
+    def set_cell(self, column: attributes._Attribute, value: bytes, timestamp=None):
+        self.cells[hbase_utils.build_column_spec(column)] = (value, timestamp)
+
+
+def _schema_entry(column_family: ColumnFamilyConfig) -> dict[str, str]:
+    """One column family's REST schema entry, with its versions and TTL when set."""
+    entry = {"name": column_family.family_id}
+    if column_family.max_versions is not None:
+        entry["VERSIONS"] = str(column_family.max_versions)
+    if column_family.max_age is not None:
+        entry["TTL"] = str(int(column_family.max_age.total_seconds()))
+    return entry
 
 
 class Client(ClientWithIDGen, OperationLogger):
@@ -130,57 +96,39 @@ class Client(ClientWithIDGen, OperationLogger):
     def close(self):
         self._session.close()
 
-    def _url(self, path: str) -> str:
-        return f"{self._base_url}/{path}"
-
     def _table_url(self, suffix: str = "") -> str:
-        return self._url(f"{self._table_id}{suffix}")
+        return f"{self._base_url}/{self._table_id}{suffix}"
 
-    def _create_column_families(self, column_families=None):
-        if column_families is None:
-            column_families = DEFAULT_COLUMN_FAMILIES
-        column_schemas = []
-        for cf in column_families:
-            cs = {"name": cf.family_id}
-            if cf.max_versions is not None:
-                cs["VERSIONS"] = str(cf.max_versions)
-            if cf.max_age is not None:
-                cs["TTL"] = str(int(cf.max_age.total_seconds()))
-            column_schemas.append(cs)
-        schema = {
-            "name": self._table_id,
-            "ColumnSchema": column_schemas,
-        }
+    def _row_url(self, row_key: bytes, *parts) -> str:
+        """The REST URL of `row_key`, or of the column and time `parts` under it."""
+        path = "/".join((hbase_utils.encode_value(row_key), *map(str, parts)))
+        return self._table_url(f"/{path}")
+
+    def _delete(self, row_key: bytes, *parts) -> None:
+        """DELETE `row_key`, or the column or cell that `parts` name under it."""
+        self._session.delete(self._row_url(row_key, *parts))
+
+    def _put_schema(self, column_schemas: list[dict[str, str]]) -> None:
+        schema = {"name": self._table_id, "ColumnSchema": column_schemas}
         resp = self._session.put(self._table_url("/schema"), json=schema)
         resp.raise_for_status()
 
-    def create_table(self, meta, version: str, column_families=None) -> None:
-        resp = self._session.get(self._table_url("/schema"))
-        if resp.status_code == 200:
-            raise ValueError(f"{self._table_id} already exists.")
-        self._create_column_families(column_families)
-        self.add_table_version(version)
-        self.update_table_meta(meta)
+    def _table_exists(self) -> bool:
+        return self._session.get(self._table_url("/schema")).status_code == 200
+
+    def _create_storage(self, column_families) -> None:
+        self._put_schema([_schema_entry(family) for family in column_families])
 
     def create_column_family(self, family_id, gc_rule=None):
         if isinstance(family_id, ColumnFamilyConfig):
-            cf = family_id
-            schema_entry = {"name": cf.family_id}
-            if cf.max_versions is not None:
-                schema_entry["VERSIONS"] = str(cf.max_versions)
-            if cf.max_age is not None:
-                schema_entry["TTL"] = str(int(cf.max_age.total_seconds()))
-            schema = {"name": self._table_id, "ColumnSchema": [schema_entry]}
+            column_family = family_id
         else:
-            schema = {"name": self._table_id, "ColumnSchema": [{"name": family_id}]}
-            if gc_rule is not None:
-                cf_entry = schema["ColumnSchema"][0]
-                if hasattr(gc_rule, "max_num_versions"):
-                    cf_entry["VERSIONS"] = str(gc_rule.max_num_versions)
-                if hasattr(gc_rule, "max_age"):
-                    cf_entry["TTL"] = str(int(gc_rule.max_age.total_seconds()))
-        resp = self._session.put(self._table_url("/schema"), json=schema)
-        resp.raise_for_status()
+            column_family = ColumnFamilyConfig(
+                family_id,
+                max_versions=getattr(gc_rule, "max_num_versions", None),
+                max_age=getattr(gc_rule, "max_age", None),
+            )
+        self._put_schema([_schema_entry(column_family)])
 
     def mutate_row(
         self,
@@ -190,12 +138,7 @@ class Client(ClientWithIDGen, OperationLogger):
     ) -> HBaseMutation:
         mutation = HBaseMutation(row_key)
         for column, value in val_dict.items():
-            mutation.set_cell(
-                column.family_id,
-                column.key,
-                column.serialize(value),
-                timestamp=time_stamp,
-            )
+            mutation.set_cell(column, column.serialize(value), timestamp=time_stamp)
         return mutation
 
     def _write_rows(self, rows, slow_retry=True, block_size=2000):
@@ -219,6 +162,18 @@ class Client(ClientWithIDGen, OperationLogger):
         )
         resp.raise_for_status()
 
+    def _put_lock_if_absent(
+        self, row_key: bytes, operation_id: np.uint64, lock_column
+    ) -> bool:
+        """Writes `operation_id` to `lock_column`, stamped now, only if absent."""
+        return self._check_and_put(
+            row_key,
+            lock_column,
+            check_value=None,
+            put_value=lock_column.serialize(operation_id),
+            put_timestamp=get_valid_timestamp(None),
+        )
+
     def _acquire_lock_cell(
         self, row_key: bytes, operation_id: np.uint64, lock_column
     ) -> bool:
@@ -228,112 +183,46 @@ class Client(ClientWithIDGen, OperationLogger):
         HBase REST check-and-put has no server-side TTL, so expiry is
         enforced client-side against `self._lock_expiry`.
         """
-        success = self._check_and_put(
-            row_key=row_key,
-            check_family=lock_column.family_id,
-            check_qualifier=lock_column.key,
-            check_value=None,
-            put_family=lock_column.family_id,
-            put_qualifier=lock_column.key,
-            put_value=serialize_uint64(operation_id),
-            put_timestamp=get_valid_timestamp(None),
-        )
-        if success:
+        if self._put_lock_if_absent(row_key, operation_id, lock_column):
             return True
         cells = self._read_byte_row(row_key, columns=lock_column)
         if cells:
             lock_ts = cells[0].timestamp
             if lock_ts and datetime.now(timezone.utc) - lock_ts > self._lock_expiry:
-                self._delete_cell(row_key, lock_column.family_id, lock_column.key)
+                self._delete_column(row_key, lock_column)
                 return self._acquire_lock_cell(row_key, operation_id, lock_column)
             if self.logger.isEnabledFor(logging.DEBUG):
-                self.logger.debug(f"Locked operation ids: {[c.value for c in cells]}")
+                log_lock_holders(self.logger, "Locked", cells)
         return False
 
     def _release_lock_cell(
         self, row_key: bytes, operation_id: np.uint64, lock_column
     ) -> bool:
-        return self._check_and_delete(
-            row_key=row_key,
-            check_family=lock_column.family_id,
-            check_qualifier=lock_column.key,
-            check_value=serialize_uint64(operation_id),
-        )
-
-    def _renew_lock_cell(
-        self, row_key: bytes, operation_id: np.uint64, lock_column
-    ) -> bool:
-        return self._check_and_put(
-            row_key=row_key,
-            check_family=lock_column.family_id,
-            check_qualifier=lock_column.key,
-            check_value=serialize_uint64(operation_id),
-            put_family=lock_column.family_id,
-            put_qualifier=lock_column.key,
-            put_value=lock_column.serialize(operation_id),
-        )
+        """Deletes `lock_column`'s cell if it holds `operation_id`."""
+        col_spec = hbase_utils.build_column_spec(lock_column)
+        cell = hbase_utils.build_cell(col_spec, lock_column.serialize(operation_id))
+        return self._check(row_key, col_spec, "delete", [cell])
 
     def lock_root(self, root_id: np.uint64, operation_id: np.uint64) -> bool:
-        lock_column = attributes.Concurrency.Lock
-        row_key = serialize_uint64(root_id)
-        if not self._acquire_lock_cell(row_key, operation_id, lock_column):
-            return False
-        # Root-specific guard: an indefinite lock on the same row must
-        # block acquisition. HBase REST check-and-put only checks one
-        # column, so we acquire the temporal lock and then verify the
-        # indefinite column is empty, rolling back if not.
-        indefinite_lock_column = attributes.Concurrency.IndefiniteLock
-        if self._read_byte_row(row_key, columns=indefinite_lock_column):
-            self._delete_cell(row_key, lock_column.family_id, lock_column.key)
-            return False
-        return True
+        return self.lock_by_row_key_with_indefinite(
+            serialize_uint64(root_id), operation_id
+        )
 
     def lock_root_indefinitely(
         self, root_id: np.uint64, operation_id: np.uint64
     ) -> bool:
-        # Not routed through `_acquire_lock_cell` on purpose: that helper
-        # treats stale cells as expired and deletes them, but indefinite
-        # locks never expire — so a stale-looking cell here is still held.
-        lock_column = attributes.Concurrency.IndefiniteLock
         row_key = serialize_uint64(root_id)
-        success = self._check_and_put(
-            row_key=row_key,
-            check_family=lock_column.family_id,
-            check_qualifier=lock_column.key,
-            check_value=None,
-            put_family=lock_column.family_id,
-            put_qualifier=lock_column.key,
-            put_value=serialize_uint64(operation_id),
-            put_timestamp=get_valid_timestamp(None),
-        )
-        if success:
+        if self.lock_by_row_key_indefinitely(row_key, operation_id):
             return True
         if self.logger.isEnabledFor(logging.DEBUG):
+            lock_column = attributes.Concurrency.IndefiniteLock
             cells = self._read_byte_row(row_key, columns=lock_column)
             if cells:
-                self.logger.debug(
-                    f"Indefinitely locked operation ids: {[c.value for c in cells]}"
-                )
+                log_lock_holders(self.logger, "Indefinitely locked", cells)
         return False
 
-    def unlock_root(self, root_id: np.uint64, operation_id: np.uint64):
-        return self._release_lock_cell(
-            serialize_uint64(root_id), operation_id, attributes.Concurrency.Lock
-        )
-
-    def unlock_indefinitely_locked_root(
-        self, root_id: np.uint64, operation_id: np.uint64
-    ):
-        return self._release_lock_cell(
-            serialize_uint64(root_id),
-            operation_id,
-            attributes.Concurrency.IndefiniteLock,
-        )
-
     def renew_lock(self, root_id: np.uint64, operation_id: np.uint64) -> bool:
-        return self._renew_lock_cell(
-            serialize_uint64(root_id), operation_id, attributes.Concurrency.Lock
-        )
+        return self.renew_lock_by_row_key(serialize_uint64(root_id), operation_id)
 
     def lock_by_row_key(self, row_key: bytes, operation_id: np.uint64) -> bool:
         return self._acquire_lock_cell(
@@ -345,40 +234,28 @@ class Client(ClientWithIDGen, OperationLogger):
     ) -> bool:
         """Temporal lock on a row key that also refuses if indefinite is held.
 
-        HBase REST check-and-put only checks a single column, so we take
-        the temporal lock first and then verify the indefinite column is
-        empty, rolling back the temporal cell if it isn't. Mirrors the
-        pattern `lock_root` uses for the same guard.
+        HBase REST check-and-put checks one column, so the temporal lock is
+        taken first and rolled back if the indefinite column holds a cell.
         """
         lock_column = attributes.Concurrency.Lock
         if not self._acquire_lock_cell(row_key, operation_id, lock_column):
             return False
         indefinite_lock_column = attributes.Concurrency.IndefiniteLock
         if self._read_byte_row(row_key, columns=indefinite_lock_column):
-            self._delete_cell(row_key, lock_column.family_id, lock_column.key)
+            self._delete_column(row_key, lock_column)
             return False
         return True
 
     def lock_by_row_key_indefinitely(
         self, row_key: bytes, operation_id: np.uint64
     ) -> bool:
-        """Indefinite-column CAS on a row key. Same persistence contract
-        as `lock_root_indefinitely`: the cell survives until explicitly
-        released or operator recovery clears it, so a stale-looking cell
-        here is still held.
+        """Indefinite-column CAS on a row key.
+
+        Indefinite locks never expire, so a stale-looking cell is still held:
+        this skips `_acquire_lock_cell`, which deletes expired cells.
         """
         lock_column = attributes.Concurrency.IndefiniteLock
-        success = self._check_and_put(
-            row_key=row_key,
-            check_family=lock_column.family_id,
-            check_qualifier=lock_column.key,
-            check_value=None,
-            put_family=lock_column.family_id,
-            put_qualifier=lock_column.key,
-            put_value=serialize_uint64(operation_id),
-            put_timestamp=get_valid_timestamp(None),
-        )
-        return bool(success)
+        return bool(self._put_lock_if_absent(row_key, operation_id, lock_column))
 
     def unlock_by_row_key(self, row_key: bytes, operation_id: np.uint64):
         return self._release_lock_cell(
@@ -388,71 +265,63 @@ class Client(ClientWithIDGen, OperationLogger):
     def unlock_indefinitely_locked_by_row_key(
         self, row_key: bytes, operation_id: np.uint64
     ):
-        """Release an indefinite row-key lock previously acquired by
-        `lock_by_row_key_indefinitely`.
-        """
+        """Release the indefinite lock on any row, roots too, holding `operation_id`."""
         return self._release_lock_cell(
             row_key, operation_id, attributes.Concurrency.IndefiniteLock
         )
 
     def renew_lock_by_row_key(self, row_key: bytes, operation_id: np.uint64) -> bool:
-        return self._renew_lock_cell(row_key, operation_id, attributes.Concurrency.Lock)
-
-    def get_compatible_timestamp(
-        self, time_stamp: datetime, round_up: bool = False
-    ) -> datetime:
-        return hbase_utils.get_hbase_compatible_time_stamp(
-            time_stamp, round_up=round_up
+        lock_column = attributes.Concurrency.Lock
+        held = lock_column.serialize(operation_id)
+        return self._check_and_put(
+            row_key, lock_column, check_value=held, put_value=held
         )
 
     def _get_ids_range(self, key: bytes, size: int) -> typing.Tuple:
-        column = attributes.Concurrency.Counter
-        col_spec = f"{column.family_id}:{column.key.decode()}"
-        key_b64 = hbase_utils.encode_value(key)
-
-        url = self._table_url(f"/{key_b64}/{col_spec}")
-        increment_body = {
-            "Row": [
-                {
-                    "key": hbase_utils.encode_value(key),
-                    "Cell": [
-                        {
-                            "column": hbase_utils.encode_value(
-                                col_spec.encode("utf-8")
-                            ),
-                            "$": hbase_utils.encode_value(struct.pack(">q", size)),
-                        }
-                    ],
-                }
-            ],
-        }
-        resp = self._session.post(
-            url,
-            json=increment_body,
+        col_spec = hbase_utils.build_column_spec(attributes.Concurrency.Counter)
+        increment = hbase_utils.build_cell(col_spec, struct.pack(">q", size))
+        resp = self._row_request(
+            self._session.post,
+            key,
+            col_spec,
+            [increment],
             headers={"Accept": "application/octet-stream"},
         )
         resp.raise_for_status()
         high = struct.unpack(">q", resp.content)[0]
         return np.uint64(high + 1 - size), np.uint64(high)
 
-    def read_all_rows(self):
-        scanner_url = self._table_url("/scanner")
-        resp = self._session.put(scanner_url, json={"batch": 1000})
+    def _scan(self, spec: dict[str, object], on_page) -> None:
+        """Feeds each page of a scanner opened with `spec` to `on_page`.
+
+        The scanner is deleted however the scan ends.
+        """
+        resp = self._session.put(self._table_url("/scanner"), json=spec)
         resp.raise_for_status()
-        scanner_location = resp.headers.get("Location", "")
+        location = resp.headers.get("Location", "")
+        try:
+            while True:
+                resp = self._session.get(
+                    location, headers={"Accept": "application/json"}
+                )
+                if resp.status_code == 204:
+                    break
+                resp.raise_for_status()
+                on_page(resp.json())
+        finally:
+            self._session.delete(location)
+
+    def read_all_rows(self):
         rows = []
-        while True:
-            resp = self._session.get(
-                scanner_location, headers={"Accept": "application/json"}
-            )
-            if resp.status_code == 204:
-                break
-            resp.raise_for_status()
-            row_data = resp.json()
-            for row in row_data.get("Row", []):
-                rows.append(row)
-        self._session.delete(scanner_location)
-        return _ConsumableRows(rows)
+        self._scan({"batch": 1000}, lambda page: rows.extend(page.get("Row", [])))
+        return LegacyRows(
+            {
+                hbase_utils.decode_value(row["key"]): LegacyRow(
+                    hbase_utils.parse_cells(row.get("Cell", [])), equal_by=row
+                )
+                for row in rows
+            }
+        )
 
     def _read_byte_rows(
         self,
@@ -500,16 +369,8 @@ class Client(ClientWithIDGen, OperationLogger):
                 "Need to either provide a valid set of rows, or both, a start row and an end row."
             )
 
-        # Deserialize cell values
-        for row_key, column_dict in rows.items():
-            if single_column:
-                for cell in column_dict:
-                    col = columns
-                    cell.value = col.deserialize(cell.value)
-            else:
-                for column, cell_entries in column_dict.items():
-                    for cell_entry in cell_entries:
-                        cell_entry.value = column.deserialize(cell_entry.value)
+        for column_dict in rows.values():
+            deserialize_cells({columns: column_dict} if single_column else column_dict)
         return rows
 
     def _read_byte_row(
@@ -520,7 +381,6 @@ class Client(ClientWithIDGen, OperationLogger):
         end_time=None,
         end_time_inclusive=False,
     ):
-        single_column = isinstance(columns, attributes._Attribute)
         row = self._read_byte_rows(
             row_keys=[row_key],
             columns=columns,
@@ -528,7 +388,7 @@ class Client(ClientWithIDGen, OperationLogger):
             end_time=end_time,
             end_time_inclusive=end_time_inclusive,
         )
-        return row.get(row_key, [] if single_column else {})
+        return row.get(row_key, column_view({}, columns))
 
     def _fetch_rows_by_keys(
         self,
@@ -579,137 +439,64 @@ class Client(ClientWithIDGen, OperationLogger):
         if col_specs:
             scanner_spec["column"] = col_specs
 
-        if start_time:
-            ts = hbase_utils.datetime_to_hbase_ts(
-                hbase_utils.get_hbase_compatible_time_stamp(start_time)
-            )
-            scanner_spec["startTime"] = ts
-        if end_time:
-            et = hbase_utils.get_hbase_compatible_time_stamp(
-                end_time, round_up=end_time_inclusive
-            )
-            scanner_spec["endTime"] = hbase_utils.datetime_to_hbase_ts(et)
-
-        scanner_url = self._table_url("/scanner")
-        resp = self._session.put(scanner_url, json=scanner_spec)
-        resp.raise_for_status()
-        scanner_location = resp.headers.get("Location", "")
+        bounds = get_compatible_time_range(start_time, end_time, end_time_inclusive)
+        if bounds.start is not None:
+            scanner_spec["startTime"] = hbase_utils.datetime_to_hbase_ts(bounds.start)
+        if bounds.end is not None:
+            scanner_spec["endTime"] = hbase_utils.datetime_to_hbase_ts(bounds.end)
 
         result = {}
-        try:
-            while True:
-                resp = self._session.get(
-                    scanner_location, headers={"Accept": "application/json"}
-                )
-                if resp.status_code == 204:
-                    break
-                resp.raise_for_status()
-                parsed = hbase_utils.parse_cell_response(
-                    resp.json(), single_column=single_column
-                )
-                result.update(parsed)
-        finally:
-            self._session.delete(scanner_location)
+        self._scan(
+            scanner_spec,
+            lambda page: result.update(
+                hbase_utils.parse_cell_response(page, single_column=single_column)
+            ),
+        )
         return result
 
     def _delete_meta(self):
-        key_b64 = hbase_utils.encode_value(attributes.TableMeta.key)
-        self._session.delete(self._table_url(f"/{key_b64}"))
+        self._delete(attributes.TableMeta.key)
 
     def delete_cells(self, mutations, row_keys_to_delete=None):
         for row_key, column, timestamps in mutations:
-            col_spec = f"{column.family_id}:{column.key.decode()}"
+            col_spec = hbase_utils.build_column_spec(column)
             for ts in timestamps:
-                ts_ms = hbase_utils.datetime_to_hbase_ts(ts)
-                key_b64 = hbase_utils.encode_value(row_key)
-                url = self._table_url(f"/{key_b64}/{col_spec}/{ts_ms}")
-                self._session.delete(url)
+                self._delete(row_key, col_spec, hbase_utils.datetime_to_hbase_ts(ts))
         for key in row_keys_to_delete or []:
-            key_b64 = hbase_utils.encode_value(key)
-            self._session.delete(self._table_url(f"/{key_b64}"))
+            self._delete(key)
 
     def delete_row(self, row_key):
-        key_b64 = hbase_utils.encode_value(row_key)
-        self._session.delete(self._table_url(f"/{key_b64}"))
+        self._delete(row_key)
 
     def _check_and_put(
         self,
         row_key: bytes,
-        check_family: str,
-        check_qualifier: bytes,
-        check_value,
-        put_family: str,
-        put_qualifier: bytes,
+        column: attributes._Attribute,
+        check_value: bytes | None,
         put_value: bytes,
-        put_timestamp: datetime = None,
+        put_timestamp: datetime | None = None,
     ) -> bool:
-        key_b64 = hbase_utils.encode_value(row_key)
-        col_spec = f"{check_family}:{check_qualifier.decode()}"
-        url = self._table_url(f"/{key_b64}/{col_spec}?check=put")
+        """Puts `put_value` in `column` if its cell holds `check_value`.
 
-        put_col_spec = f"{put_family}:{put_qualifier.decode()}"
-        cell = {
-            "column": hbase_utils.encode_value(put_col_spec.encode("utf-8")),
-            "$": hbase_utils.encode_value(put_value),
-        }
-        if put_timestamp:
-            cell["timestamp"] = hbase_utils.datetime_to_hbase_ts(put_timestamp)
-
-        body = {
-            "Row": [
-                {
-                    "key": hbase_utils.encode_value(row_key),
-                    "Cell": [cell],
-                }
-            ],
-        }
-
+        A `check_value` of None requires the cell to be absent.
+        """
+        col_spec = hbase_utils.build_column_spec(column)
+        cells = [hbase_utils.build_cell(col_spec, put_value, put_timestamp)]
         if check_value is not None:
-            body["Row"][0]["Cell"].insert(
-                0,
-                {
-                    "column": hbase_utils.encode_value(col_spec.encode("utf-8")),
-                    "$": hbase_utils.encode_value(
-                        check_value
-                        if isinstance(check_value, bytes)
-                        else serialize_uint64(check_value)
-                    ),
-                },
-            )
+            cells.insert(0, hbase_utils.build_cell(col_spec, check_value))
+        return self._check(row_key, col_spec, "put", cells)
 
-        resp = self._session.put(url, json=body)
+    def _check(self, row_key: bytes, col_spec: str, action: str, cells) -> bool:
+        """Check-and-`action` of `cells` on `row_key`; True when HBase applied it."""
+        resp = self._row_request(
+            self._session.put, row_key, col_spec, cells, f"?check={action}"
+        )
         return resp.status_code == 200
 
-    def _check_and_delete(
-        self,
-        row_key: bytes,
-        check_family: str,
-        check_qualifier: bytes,
-        check_value: bytes,
-    ) -> bool:
-        key_b64 = hbase_utils.encode_value(row_key)
-        col_spec = f"{check_family}:{check_qualifier.decode()}"
-        url = self._table_url(f"/{key_b64}/{col_spec}?check=delete")
+    def _row_request(self, send, row_key: bytes, col_spec: str, cells, query="", **kw):
+        """Sends `cells` as one row's CellSet to `col_spec` of `row_key` by `send`."""
+        body = hbase_utils.build_cellset([hbase_utils.build_row(row_key, cells)])
+        return send(self._row_url(row_key, col_spec) + query, json=body, **kw)
 
-        body = {
-            "Row": [
-                {
-                    "key": hbase_utils.encode_value(row_key),
-                    "Cell": [
-                        {
-                            "column": hbase_utils.encode_value(
-                                col_spec.encode("utf-8")
-                            ),
-                            "$": hbase_utils.encode_value(check_value),
-                        }
-                    ],
-                }
-            ],
-        }
-        resp = self._session.put(url, json=body)
-        return resp.status_code == 200
-
-    def _delete_cell(self, row_key: bytes, family_id: str, qualifier: bytes):
-        key_b64 = hbase_utils.encode_value(row_key)
-        col_spec = f"{family_id}:{qualifier.decode()}"
-        self._session.delete(self._table_url(f"/{key_b64}/{col_spec}"))
+    def _delete_column(self, row_key: bytes, column: attributes._Attribute) -> None:
+        self._delete(row_key, hbase_utils.build_column_spec(column))

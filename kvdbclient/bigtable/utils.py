@@ -21,7 +21,7 @@ from google.cloud.bigtable.data.row_filters import ColumnQualifierRegexFilter
 
 from .. import attributes
 from ..base import Cell as BaseCell
-from ..utils import get_compatible_time_stamp as get_google_compatible_time_stamp
+from ..utils import get_compatible_time_range, get_compatible_time_stamp
 
 
 def _exact_column_filter(col: attributes._Attribute) -> ColumnRangeFilter:
@@ -91,13 +91,9 @@ def _get_time_range_filter(
     end_time: Optional[datetime] = None,
     end_inclusive: bool = True,
 ) -> RowFilter:
-    """Generates a TimeStampRangeFilter which is inclusive for start and (optionally) end."""
-    # Comply to resolution of BigTables TimeRange
-    if start_time is not None:
-        start_time = get_google_compatible_time_stamp(start_time, round_up=False)
-    if end_time is not None:
-        end_time = get_google_compatible_time_stamp(end_time, round_up=end_inclusive)
-    return TimestampRangeFilter(start=start_time, end=end_time)
+    """A TimestampRangeFilter over the bounds, rounded to Bigtable's millisecond."""
+    bounds = get_compatible_time_range(start_time, end_time, end_inclusive)
+    return TimestampRangeFilter(start=bounds.start, end=bounds.end)
 
 
 def get_time_range_and_column_filter(
@@ -128,26 +124,41 @@ def get_time_range_and_column_filter(
     return filters[0]
 
 
+def _unexpired(lock_expiry: timedelta) -> TimestampRangeFilter:
+    """Keeps lock cells written within `lock_expiry`, to Bigtable's millisecond."""
+    cutoff = get_compatible_time_stamp(datetime.now(timezone.utc) - lock_expiry)
+    return TimestampRangeFilter(start=cutoff)
+
+
+def _held_by(lock_column, operation_id: np.uint64) -> list[RowFilter]:
+    """Filters keeping `lock_column`'s cell only while it holds `operation_id`."""
+    return [
+        _exact_column_filter(lock_column),
+        _exact_value_filter(lock_column.serialize(operation_id)),
+    ]
+
+
+def _new_parent_filter() -> ColumnRangeFilter:
+    """Matches a superseded root's NewParent cell."""
+    return _exact_column_filter(attributes.Hierarchy.NewParent)
+
+
+def _refused_or_superseded(predicate: RowFilter) -> ConditionalRowFilter:
+    """Matches when `predicate` does, and otherwise when the root has a NewParent."""
+    return ConditionalRowFilter(
+        predicate_filter=predicate,
+        true_filter=PassAllFilter(True),
+        false_filter=_new_parent_filter(),
+    )
+
+
 def get_row_key_lock_filter(lock_column, lock_expiry) -> RowFilterChain:
     """Acquire-side filter for a temporal CAS lock on an arbitrary row.
 
-    Matches any non-expired cell in the lock column. A match means the
-    lock is held, so `check_and_mutate_row` should NOT apply the acquire
-    mutation; an empty result means the row is free.
-
-    Used directly by `lock_by_row_key` and composed into
-    `get_root_lock_filter` (root locks layer extra hierarchy checks on
-    top of this same temporal match).
+    Matches any unexpired cell in the lock column: a match means the lock is held, so
+    `check_and_mutate_row` must not apply the acquire mutation.
     """
-    time_cutoff = datetime.now(timezone.utc) - lock_expiry
-    # Comply to resolution of BigTables TimeRange
-    time_cutoff -= timedelta(microseconds=time_cutoff.microsecond % 1000)
-    return RowFilterChain(
-        [
-            TimestampRangeFilter(start=time_cutoff),
-            _exact_column_filter(lock_column),
-        ]
-    )
+    return RowFilterChain([_unexpired(lock_expiry), _exact_column_filter(lock_column)])
 
 
 def get_root_lock_filter(
@@ -157,15 +168,10 @@ def get_root_lock_filter(
     # returns the NewParent column when no lock is held — so a superseded
     # root (has NewParent) cannot be acquired even though its lock cell
     # is free.
-    return ConditionalRowFilter(
-        predicate_filter=RowFilterUnion(
-            [
-                _exact_column_filter(indefinite_lock_column),
-                get_row_key_lock_filter(lock_column, lock_expiry),
-            ]
-        ),
-        true_filter=PassAllFilter(True),
-        false_filter=_exact_column_filter(attributes.Hierarchy.NewParent),
+    return _refused_or_superseded(
+        get_row_key_lock_filter_with_indefinite(
+            lock_column, lock_expiry, indefinite_lock_column
+        )
     )
 
 
@@ -175,12 +181,11 @@ def get_row_key_lock_filter_with_indefinite(
     """Acquire-side filter for a temporal row-key lock extended to fail
     if an indefinite lock cell exists on the same row.
 
-    Counterpart to `get_root_lock_filter` but without the NewParent
-    hierarchy check (row-key locks have no lineage). Used for locks that
-    need the same crash-safety root locks have: a worker that dies
-    holding the indefinite column leaves that cell set, and a subsequent
-    temporal acquire must see it and refuse rather than racing into
-    partial state.
+    `get_root_lock_filter` adds the NewParent hierarchy check on top (row-key
+    locks have no lineage). Used for locks that need the same crash-safety
+    root locks have: a worker that dies holding the indefinite column leaves
+    that cell set, and a subsequent temporal acquire must see it and refuse
+    rather than racing into partial state.
     """
     return RowFilterUnion(
         [
@@ -191,38 +196,28 @@ def get_row_key_lock_filter_with_indefinite(
 
 
 def get_indefinite_root_lock_filter(lock_column) -> ConditionalRowFilter:
-    return ConditionalRowFilter(
-        predicate_filter=_exact_column_filter(lock_column),
-        true_filter=PassAllFilter(True),
-        false_filter=_exact_column_filter(attributes.Hierarchy.NewParent),
-    )
+    return _refused_or_superseded(get_indefinite_row_key_lock_filter(lock_column))
 
 
 def get_indefinite_row_key_lock_filter(lock_column) -> ColumnRangeFilter:
     """Acquire-side filter for an indefinite row-key lock.
 
-    Row-key variant of `get_indefinite_root_lock_filter` without the
-    NewParent hierarchy check. A match (indefinite cell exists) means
-    the lock is held → acquire refuses.
+    `get_indefinite_root_lock_filter` adds the NewParent hierarchy check on
+    top. A match (indefinite cell exists) means the lock is held → acquire
+    refuses.
     """
     return _exact_column_filter(lock_column)
 
 
-def get_row_key_renew_lock_filter(
+def get_held_lock_filter(
     lock_column: attributes._Attribute, operation_id: np.uint64
 ) -> RowFilterChain:
-    """'Is this lock still held by operation_id?' for generic row keys.
+    """'Is this lock still held by operation_id?' for any row.
 
-    A match means our lock cell still exists → caller should renew (run
-    SetCell in `true_case_mutations`). No NewParent handling — arbitrary
-    rows have no hierarchy relationship.
+    A match means the cell holds `operation_id`: a renew sets it again, and
+    an indefinite unlock deletes it.
     """
-    return RowFilterChain(
-        [
-            _exact_column_filter(lock_column),
-            _exact_value_filter(lock_column.serialize(operation_id)),
-        ]
-    )
+    return RowFilterChain(_held_by(lock_column, operation_id))
 
 
 def get_renew_lock_filter(
@@ -234,31 +229,16 @@ def get_renew_lock_filter(
     # expected case so `check_and_mutate_row` runs SetCell as
     # `false_case_mutations`.
     return ConditionalRowFilter(
-        predicate_filter=get_row_key_renew_lock_filter(lock_column, operation_id),
-        true_filter=_exact_column_filter(attributes.Hierarchy.NewParent),
+        predicate_filter=get_held_lock_filter(lock_column, operation_id),
+        true_filter=_new_parent_filter(),
         false_filter=PassAllFilter(True),
     )
 
 
-def get_unlock_root_filter(lock_column, lock_expiry, operation_id) -> RowFilterChain:
-    time_cutoff = datetime.now(timezone.utc) - lock_expiry
-    # Comply to resolution of BigTables TimeRange
-    time_cutoff -= timedelta(microseconds=time_cutoff.microsecond % 1000)
-    time_filter = TimestampRangeFilter(start=time_cutoff)
-
+def get_unexpired_held_lock_filter(
+    lock_column, lock_expiry, operation_id
+) -> RowFilterChain:
+    """Matches `lock_column`'s unexpired cell holding `operation_id`, on any row."""
     return RowFilterChain(
-        [
-            time_filter,
-            _exact_column_filter(lock_column),
-            _exact_value_filter(lock_column.serialize(operation_id)),
-        ]
-    )
-
-
-def get_indefinite_unlock_root_filter(lock_column, operation_id) -> RowFilterChain:
-    return RowFilterChain(
-        [
-            _exact_column_filter(lock_column),
-            _exact_value_filter(lock_column.serialize(operation_id)),
-        ]
+        [_unexpired(lock_expiry), *_held_by(lock_column, operation_id)]
     )

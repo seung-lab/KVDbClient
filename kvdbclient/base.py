@@ -6,6 +6,7 @@ from abc import ABC
 from abc import abstractmethod
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import numpy as np
@@ -20,6 +21,7 @@ from .serializers import serialize_uint64_batch
 from .serializers import deserialize_uint64
 from .extensions import RootExtension
 from .registry import register_backend
+from .utils import get_compatible_time_stamp
 
 
 @dataclass(frozen=True)
@@ -38,6 +40,24 @@ DEFAULT_COLUMN_FAMILIES = [
     ColumnFamilyConfig("3", max_age=timedelta(days=365)),
     ColumnFamilyConfig("4"),
 ]
+
+# A root chunk counts its ids over this many rows, so concurrent edits rarely share one.
+COUNTER_SHARDS = 2**8
+
+
+def counter_key(chunk_id) -> bytes:
+    """The row counting a chunk's ids, unsharded."""
+    return serialize_uint64(chunk_id, counter=True)
+
+
+def counter_shard_key(chunk_id, shard) -> bytes:
+    """The row holding one shard of a chunk's sharded id counter."""
+    return serialize_key(f"i{pad_node_id(chunk_id)}_{shard}")
+
+
+def shard_segment_id(value, shard):
+    """The segment id that counter `value` in shard row `shard` stands for."""
+    return value * np.uint64(COUNTER_SHARDS) + shard
 
 
 class Cell:
@@ -65,6 +85,141 @@ class Cell:
         return f"Cell(value={self.value!r}, timestamp={self.timestamp!r})"
 
 
+def deserialize_cells(column_dict: dict[attributes._Attribute, list]) -> None:
+    """Deserializes, in place, each cell value in `column_dict` by its column."""
+    for column, cells in column_dict.items():
+        for cell in cells:
+            cell.value = column.deserialize(cell.value)
+
+
+def column_view(column_dict: dict[attributes._Attribute, list], columns):
+    """`column_dict`, or only its cells in `columns` when that names one column."""
+    if isinstance(columns, attributes._Attribute):
+        return column_dict.get(columns, [])
+    return column_dict
+
+
+class LegacyRow:
+    """A row as legacy readers see it, `.cells` as {family: {qualifier: [Cell, ...]}}.
+
+    Rows compare by `equal_by` when given, else by their cells, and hash by identity.
+    """
+
+    __slots__ = ("cells", "_equal_by")
+
+    def __init__(self, cells: typing.Iterable[tuple[str, bytes, Cell]], equal_by=None):
+        families = defaultdict(lambda: defaultdict(list))
+        for family, qualifier, cell in cells:
+            families[family][qualifier].append(cell)
+        self.cells = dict(families)
+        self._equal_by = self.cells if equal_by is None else equal_by
+
+    def __eq__(self, other):
+        if not isinstance(other, LegacyRow):
+            return NotImplemented
+        return self._equal_by == other._equal_by
+
+    def __hash__(self):
+        return id(self)
+
+
+class LegacyRows:
+    """Rows by key, with a legacy `consume_all` that has nothing left to read."""
+
+    __slots__ = ("rows",)
+
+    def __init__(self, rows: dict[bytes, LegacyRow]):
+        self.rows = rows
+
+    def consume_all(self):
+        pass
+
+
+# Calls in flight at once while an op takes, renews, releases or dates its root locks.
+LOCK_WORKERS = 8
+
+
+class _Outcome(typing.NamedTuple):
+    """One call of a fanned-out lock method: its arguments, and its result or error."""
+
+    call: typing.Tuple[typing.Any, ...]
+    result: typing.Any
+    error: typing.Optional[Exception]
+
+    @property
+    def ok(self) -> bool:
+        return self.error is None and bool(self.result)
+
+
+def _with_future_roots(root_ids, lookup) -> np.ndarray:
+    """`root_ids`, read once, each root with future roots from `lookup` replaced by them.
+
+    A root that `lookup` cannot find raises from that lookup.
+    """
+    expanded = []
+    for root_id in root_ids:
+        future = lookup(root_id)
+        if not future.size:
+            expanded.append(root_id)
+        else:
+            expanded.extend(future)
+    return np.unique(expanded)
+
+
+_LOCK_FAILED = "Failed to lock root {root}: {error}"
+_UNLOCK_FAILED = "Failed to unlock root: {error}"
+
+
+def _fan_out(method, calls) -> list[_Outcome]:
+    """Each `method(*call)` on up to `LOCK_WORKERS` threads, in completion order."""
+    outcomes = []
+    if not calls:
+        return outcomes
+    with ThreadPoolExecutor(max_workers=min(LOCK_WORKERS, len(calls))) as executor:
+        futures = {executor.submit(method, *call): call for call in calls}
+        for future in as_completed(futures):
+            call = futures[future]
+            try:
+                outcomes.append(_Outcome(call, future.result(), None))
+            except Exception as error:
+                outcomes.append(_Outcome(call, None, error))
+    return outcomes
+
+
+def _log_errors(logger: logging.Logger, outcomes: list[_Outcome], message: str) -> None:
+    """Logs each failed outcome's error with `message`, which may name the root."""
+    for outcome in outcomes:
+        if outcome.error is not None:
+            logger.error(message.format(root=outcome.call[0], error=outcome.error))
+
+
+def _lock_each(
+    logger: logging.Logger, lock, unlock, root_ids, operation_id
+) -> list[_Outcome]:
+    """Locks every root with `lock`; if any refuses, releases them all with `unlock`."""
+    calls = [(root_id, operation_id) for root_id in root_ids]
+    locked = _fan_out(lock, calls)
+    _log_errors(logger, locked, _LOCK_FAILED)
+    if not all(outcome.ok for outcome in locked):
+        _log_errors(logger, _fan_out(unlock, calls), _UNLOCK_FAILED)
+    return locked
+
+
+def log_lock_holders(logger: logging.Logger, prefix: str, cells) -> None:
+    """Logs at debug the op ids a lock's `cells` hold, after `prefix`."""
+    logger.debug(f"{prefix} operation ids: {[cell.value for cell in cells]}")
+
+
+def _flatten_log(record: dict[attributes._Attribute, list]) -> datetime:
+    """Flattens an op-log `record` to its newest values in place; returns its op time."""
+    try:
+        timestamp = record[attributes.OperationLogs.OperationTimeStamp][0].value
+    except KeyError:
+        timestamp = record[attributes.OperationLogs.RootID][0].timestamp
+    record.update((column, cells[0].value) for column, cells in record.items())
+    return timestamp
+
+
 class SimpleClient(ABC):
     """
     Abstract class for interacting with backend data store.
@@ -76,7 +231,7 @@ class SimpleClient(ABC):
     default_client_info = None
 
     def __init_subclass__(cls, **kwargs):
-        """Register a backend that declares its own ``backend_name``; an incomplete one fails."""
+        """Registers a subclass declaring ``backend_name``; an incomplete one fails."""
         super().__init_subclass__(**kwargs)
         if "backend_name" not in cls.__dict__:
             return
@@ -120,9 +275,23 @@ class SimpleClient(ABC):
     def __exit__(self, *exc):
         self.close()
 
-    @abstractmethod
     def create_table(self, meta, version: str, column_families=None) -> None:
         """Initialize the table and store associated meta."""
+        if self._table_exists():
+            raise ValueError(f"{self._table_id} already exists.")
+        if column_families is None:
+            column_families = DEFAULT_COLUMN_FAMILIES
+        self._create_storage(column_families)
+        self.add_table_version(version)
+        self.update_table_meta(meta)
+
+    @abstractmethod
+    def _table_exists(self) -> bool:
+        """Whether the table's storage exists."""
+
+    @abstractmethod
+    def _create_storage(self, column_families) -> None:
+        """Create the table's storage with `column_families`."""
 
     @abstractmethod
     def mutate_row(self, row_key, val_dict, time_stamp=None):
@@ -156,13 +325,17 @@ class SimpleClient(ABC):
     def lock_root_indefinitely(self, node_id, operation_id):
         """Locks root node with operation_id to prevent race conditions."""
 
-    @abstractmethod
-    def unlock_root(self, node_id, operation_id):
+    def unlock_root(self, root_id: np.uint64, operation_id: np.uint64):
         """Unlocks root node that is locked with operation_id."""
+        return self.unlock_by_row_key(serialize_uint64(root_id), operation_id)
 
-    @abstractmethod
-    def unlock_indefinitely_locked_root(self, node_id, operation_id):
+    def unlock_indefinitely_locked_root(
+        self, root_id: np.uint64, operation_id: np.uint64
+    ):
         """Unlocks root node that is indefinitely locked with operation_id."""
+        return self.unlock_indefinitely_locked_by_row_key(
+            serialize_uint64(root_id), operation_id
+        )
 
     @abstractmethod
     def renew_lock(self, node_id, operation_id):
@@ -216,9 +389,10 @@ class SimpleClient(ABC):
     def renew_lock_by_row_key(self, row_key, operation_id):
         """Extend the expiry of a lock acquired via `lock_by_row_key`."""
 
-    @abstractmethod
-    def get_compatible_timestamp(self, time_stamp, round_up=False):
+    @staticmethod
+    def get_compatible_timestamp(time_stamp, round_up=False):
         """Datetime time stamp compatible with client's services."""
+        return get_compatible_time_stamp(time_stamp, round_up=round_up)
 
     @abstractmethod
     def read_all_rows(self):
@@ -274,37 +448,41 @@ class SimpleClient(ABC):
         if not overwrite:
             assert self.read_table_version() is None, self.read_table_version()
         self._version = version
-        row = self.mutate_row(
-            attributes.TableVersion.key,
-            {attributes.TableVersion.Version: version},
+        self._write_cell(
+            attributes.TableVersion.key, attributes.TableVersion.Version, version
         )
-        self.write([row])
 
     def read_table_version(self) -> str:
-        try:
-            row = self._read_byte_row(attributes.TableVersion.key)
-            self._version = row[attributes.TableVersion.Version][0].value
-            return self._version
-        except KeyError:
-            return None
+        version = self._read_cell(
+            attributes.TableVersion.key, attributes.TableVersion.Version
+        )
+        if version is not None:
+            self._version = version
+        return version
 
     def update_table_meta(self, meta, overwrite: typing.Optional[bool] = False):
         if overwrite:
             self._delete_meta()
         self._table_meta = meta
-        row = self.mutate_row(
-            attributes.TableMeta.key,
-            {attributes.TableMeta.Meta: meta},
-        )
-        self.write([row])
+        self._write_cell(attributes.TableMeta.key, attributes.TableMeta.Meta, meta)
 
     def read_table_meta(self):
-        row = self._read_byte_row(attributes.TableMeta.key)
-        try:
-            self._table_meta = row[attributes.TableMeta.Meta][0].value
-        except KeyError:
-            self._table_meta = None
+        self._table_meta = self._read_cell(
+            attributes.TableMeta.key, attributes.TableMeta.Meta
+        )
         return self._table_meta
+
+    def _write_cell(self, row_key: bytes, column, value) -> None:
+        """Writes `value` to `column` of row `row_key`."""
+        self.write([self.mutate_row(row_key, {column: value})])
+
+    def _read_cell(self, row_key: bytes, column):
+        """The newest value in `column` of row `row_key`, or None when it holds none."""
+        row = self._read_byte_row(row_key)
+        try:
+            return row[column][0].value
+        except KeyError:
+            return None
 
     def read_nodes(
         self,
@@ -385,12 +563,7 @@ class SimpleClient(ABC):
         )
         if len(log_record) == 0:
             return {}, None
-        try:
-            timestamp = log_record[attributes.OperationLogs.OperationTimeStamp][0].value
-        except KeyError:
-            timestamp = log_record[attributes.OperationLogs.RootID][0].timestamp
-        log_record.update((column, v[0].value) for column, v in log_record.items())
-        return log_record, timestamp
+        return log_record, _flatten_log(log_record)
 
     def read_log_entries(
         self,
@@ -403,89 +576,44 @@ class SimpleClient(ABC):
     ):
         if properties is None:
             properties = attributes.OperationLogs.all()
-
+        filters = dict(
+            user_id=user_id,
+            properties=properties,
+            start_time=start_time,
+            end_time=end_time,
+            end_time_inclusive=end_time_inclusive,
+        )
         if operation_ids is None:
             logs_d = self.read_nodes(
                 start_id=np.uint64(0),
                 end_id=self.get_max_operation_id(),
                 end_id_inclusive=True,
-                user_id=user_id,
-                properties=properties,
-                start_time=start_time,
-                end_time=end_time,
-                end_time_inclusive=end_time_inclusive,
+                **filters,
             )
         else:
-            logs_d = self.read_nodes(
-                node_ids=operation_ids,
-                properties=properties,
-                start_time=start_time,
-                end_time=end_time,
-                end_time_inclusive=end_time_inclusive,
-                user_id=user_id,
-            )
+            logs_d = self.read_nodes(node_ids=operation_ids, **filters)
         if not logs_d:
             return {}
-        for operation_id in logs_d:
-            log_record = logs_d[operation_id]
-            try:
-                timestamp = log_record[attributes.OperationLogs.OperationTimeStamp][
-                    0
-                ].value
-            except KeyError:
-                timestamp = log_record[attributes.OperationLogs.RootID][0].timestamp
-            log_record.update((column, v[0].value) for column, v in log_record.items())
-            log_record["timestamp"] = timestamp
+        for record in logs_d.values():
+            record["timestamp"] = _flatten_log(record)
         return logs_d
 
     def lock_roots(
         self,
         root_ids: typing.Sequence[np.uint64],
         operation_id: np.uint64,
-        future_root_ids_d: typing.Dict,
+        future_root_ids_d: dict[np.uint64, np.ndarray],
         max_tries: int = 1,
         waittime_s: float = 0.5,
     ) -> typing.Tuple[bool, typing.Iterable]:
         i_try = 0
         while i_try < max_tries:
-            new_root_ids: typing.List[np.uint64] = []
-            for root_id in root_ids:
-                future_root_ids = future_root_ids_d[root_id]
-                if not future_root_ids.size:
-                    new_root_ids.append(root_id)
-                else:
-                    new_root_ids.extend(future_root_ids)
-
-            lock_results = {}
-            root_ids = np.unique(new_root_ids)
-            max_workers = min(8, max(1, len(root_ids)))
-            with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                future_to_root = {
-                    executor.submit(self.lock_root, root_id, operation_id): root_id
-                    for root_id in root_ids
-                }
-                for future in as_completed(future_to_root):
-                    root_id = future_to_root[future]
-                    try:
-                        lock_results[root_id] = future.result()
-                    except Exception as e:
-                        self.logger.error(f"Failed to lock root {root_id}: {e}")
-                        lock_results[root_id] = False
-
-            all_locked = all(lock_results.values())
-            if all_locked:
+            root_ids = _with_future_roots(root_ids, future_root_ids_d.__getitem__)
+            locked = _lock_each(
+                self.logger, self.lock_root, self.unlock_root, root_ids, operation_id
+            )
+            if all(outcome.ok for outcome in locked):
                 return True, root_ids
-
-            with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                unlock_futures = [
-                    executor.submit(self.unlock_root, root_id, operation_id)
-                    for root_id in root_ids
-                ]
-                for future in as_completed(unlock_futures):
-                    try:
-                        future.result()
-                    except Exception as e:
-                        self.logger.error(f"Failed to unlock root: {e}")
             time.sleep(waittime_s)
             i_try += 1
             self.logger.debug(f"Try {i_try}")
@@ -495,73 +623,35 @@ class SimpleClient(ABC):
         self,
         root_ids: typing.Sequence[np.uint64],
         operation_id: np.uint64,
-        future_root_ids_d: typing.Dict,
+        future_root_ids_d: dict[np.uint64, np.ndarray],
     ) -> typing.Tuple[bool, typing.Iterable, typing.Iterable]:
-        new_root_ids: typing.List[np.uint64] = []
-        for _id in root_ids:
-            future_root_ids = future_root_ids_d.get(_id)
-            if not future_root_ids.size:
-                new_root_ids.append(_id)
-            else:
-                new_root_ids.extend(future_root_ids)
-
-        root_ids = np.unique(new_root_ids)
-        lock_results = {}
-        failed_to_lock = []
-        max_workers = min(8, max(1, len(root_ids)))
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            future_to_root = {
-                executor.submit(
-                    self.lock_root_indefinitely, root_id, operation_id
-                ): root_id
-                for root_id in root_ids
-            }
-            for future in as_completed(future_to_root):
-                root_id = future_to_root[future]
-                try:
-                    lock_results[root_id] = future.result()
-                    if lock_results[root_id] is False:
-                        failed_to_lock.append(root_id)
-                except Exception as e:
-                    self.logger.error(f"Failed to lock root {root_id}: {e}")
-                    lock_results[root_id] = False
-                    failed_to_lock.append(root_id)
-
-        all_locked = all(lock_results.values())
-        if all_locked:
-            return True, root_ids, failed_to_lock
-
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            unlock_futures = [
-                executor.submit(
-                    self.unlock_indefinitely_locked_root, root_id, operation_id
-                )
-                for root_id in root_ids
-            ]
-            for future in as_completed(unlock_futures):
-                try:
-                    future.result()
-                except Exception as e:
-                    self.logger.error(f"Failed to unlock root: {e}")
-        return False, root_ids, failed_to_lock
+        root_ids = _with_future_roots(root_ids, future_root_ids_d.get)
+        locked = _lock_each(
+            self.logger,
+            self.lock_root_indefinitely,
+            self.unlock_indefinitely_locked_root,
+            root_ids,
+            operation_id,
+        )
+        failed_to_lock = [
+            outcome.call[0]
+            for outcome in locked
+            if outcome.error is not None or outcome.result is False
+        ]
+        return all(outcome.ok for outcome in locked), root_ids, failed_to_lock
 
     def renew_locks(self, root_ids: np.uint64, operation_id: np.uint64) -> bool:
-        max_workers = min(8, max(1, len(root_ids)))
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = {
-                executor.submit(self.renew_lock, root_id, operation_id): root_id
-                for root_id in root_ids
-            }
-            for future in as_completed(futures):
-                root_id = futures[future]
-                try:
-                    result = future.result()
-                    if not result:
-                        self.logger.warning(f"renew_lock failed - {root_id}")
-                        return False
-                except Exception as e:
-                    self.logger.error(f"Exception during renew_lock({root_id}): {e}")
-                    return False
+        calls = [(root_id, operation_id) for root_id in root_ids]
+        for outcome in _fan_out(self.renew_lock, calls):
+            root_id = outcome.call[0]
+            if outcome.error is not None:
+                self.logger.error(
+                    f"Exception during renew_lock({root_id}): {outcome.error}"
+                )
+                return False
+            if not outcome.result:
+                self.logger.warning(f"renew_lock failed - {root_id}")
+                return False
         return True
 
     def get_lock_timestamp(
@@ -583,26 +673,16 @@ class SimpleClient(ABC):
     ) -> typing.Union[datetime, None]:
         if len(root_ids) == 0:
             return None
-        max_workers = min(8, max(1, len(root_ids)))
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = {
-                executor.submit(self.get_lock_timestamp, root_id, op_id): (
-                    root_id,
-                    op_id,
-                )
-                for root_id, op_id in zip(root_ids, operation_ids)
-            }
-            timestamps = []
-            for future in as_completed(futures):
-                root_id, op_id = futures[future]
-                try:
-                    ts = future.result()
-                    if ts is None:
-                        return None
-                    timestamps.append(ts)
-                except Exception as exc:
-                    self.logger.warning(f"({root_id}, {op_id}): {exc}")
-                    return None
+        calls = list(zip(root_ids, operation_ids))
+        timestamps = []
+        for outcome in _fan_out(self.get_lock_timestamp, calls):
+            if outcome.error is not None:
+                root_id, op_id = outcome.call
+                self.logger.warning(f"({root_id}, {op_id}): {outcome.error}")
+                return None
+            if outcome.result is None:
+                return None
+            timestamps.append(outcome.result)
         if not timestamps:
             return None
         return np.min(timestamps)
@@ -625,9 +705,7 @@ class ClientWithIDGen(SimpleClient):
         if root_chunk:
             new_ids = self._get_root_segment_ids_range(chunk_id, size)
         else:
-            low, high = self._get_ids_range(
-                serialize_uint64(chunk_id, counter=True), size
-            )
+            low, high = self._get_ids_range(counter_key(chunk_id), size)
             low, high = basetypes.SEGMENT_ID.type(low), basetypes.SEGMENT_ID.type(high)
             new_ids = np.arange(low, high + np.uint64(1), dtype=basetypes.SEGMENT_ID)
         return new_ids | chunk_id
@@ -640,53 +718,48 @@ class ClientWithIDGen(SimpleClient):
     def set_max_node_id(self, chunk_id: np.uint64, node_id: np.uint64) -> None:
         """Set max segment ID for a given chunk."""
         size = int(np.uint64(chunk_id) ^ np.uint64(node_id))
-        self._get_ids_range(serialize_uint64(chunk_id, counter=True), size)
+        self._get_ids_range(counter_key(chunk_id), size)
 
     def get_max_node_id(
         self, chunk_id: basetypes.CHUNK_ID, root_chunk=False
     ) -> basetypes.NODE_ID:
         if root_chunk:
-            n_counters = np.uint64(2**8)
             max_value = 0
-            for counter in range(n_counters):
-                row = self._read_byte_row(
-                    serialize_key(f"i{pad_node_id(chunk_id)}_{counter}"),
-                    columns=attributes.Concurrency.Counter,
-                )
-                val = (
-                    basetypes.SEGMENT_ID.type(row[0].value if row else 0) * n_counters
-                    + counter
-                )
+            for shard in range(COUNTER_SHARDS):
+                value = self._read_counter(counter_shard_key(chunk_id, shard))
+                val = shard_segment_id(basetypes.SEGMENT_ID.type(value), shard)
                 max_value = val if val > max_value else max_value
             return chunk_id | basetypes.SEGMENT_ID.type(max_value)
-        column = attributes.Concurrency.Counter
-        row = self._read_byte_row(
-            serialize_uint64(chunk_id, counter=True), columns=column
-        )
-        return chunk_id | basetypes.SEGMENT_ID.type(row[0].value if row else 0)
+        value = self._read_counter(counter_key(chunk_id))
+        return chunk_id | basetypes.SEGMENT_ID.type(value)
 
     def create_operation_id(self):
         return self._get_ids_range(attributes.OperationLogs.key, 1)[1]
 
     def get_max_operation_id(self):
+        return self._read_counter(attributes.OperationLogs.key)
+
+    def _read_counter(self, key: bytes):
+        """The newest value of the id counter in row `key`; zero when it holds none."""
         column = attributes.Concurrency.Counter
-        row = self._read_byte_row(attributes.OperationLogs.key, columns=column)
+        row = self._read_byte_row(key, columns=column)
         return row[0].value if row else column.basetype(0)
 
     def _get_root_segment_ids_range(
         self, chunk_id: basetypes.CHUNK_ID, size: int = 1, counter: int = None
     ) -> np.ndarray:
-        n_counters = np.uint64(2**8)
+        n_counters = np.uint64(COUNTER_SHARDS)
         counter = (
             np.uint64(counter % n_counters)
             if counter
             else np.uint64(np.random.randint(0, n_counters))
         )
-        key = serialize_key(f"i{pad_node_id(chunk_id)}_{counter}")
-        min_, max_ = self._get_ids_range(key=key, size=size)
+        min_, max_ = self._get_ids_range(
+            key=counter_shard_key(chunk_id, counter), size=size
+        )
         return np.arange(
-            min_ * n_counters + counter,
-            max_ * n_counters + np.uint64(1) + counter,
+            shard_segment_id(min_, counter),
+            shard_segment_id(max_, counter) + np.uint64(1),
             n_counters,
             dtype=basetypes.SEGMENT_ID,
         )
@@ -694,8 +767,6 @@ class ClientWithIDGen(SimpleClient):
 
 class OperationLogger(ABC):
     """
-    Abstract class for interacting with backend data store where the operation logs are stored.
+    Abstract class for the backend data store that holds the operation logs.
     Eg., BigTableClient can be used to store logs in Google BigTable.
     """
-
-    # read_log_entry and read_log_entries are now concrete in SimpleClient

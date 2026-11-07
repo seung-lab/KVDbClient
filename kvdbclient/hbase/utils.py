@@ -1,31 +1,11 @@
 """HBase REST API utility functions."""
 
 import base64
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
+from typing import NamedTuple
 
 from .. import attributes
 from ..base import Cell
-
-
-def get_hbase_compatible_time_stamp(
-    time_stamp: datetime, round_up: bool = False
-) -> datetime:
-    """Round datetime to millisecond precision.
-
-    When ``round_up=True`` the result is always *strictly after* the input so
-    that it can be used as an exclusive upper bound (HBase ``endTime`` /
-    ``ts.to``) that includes the original millisecond.
-    """
-    micro_s_gap = timedelta(microseconds=time_stamp.microsecond % 1000)
-    if micro_s_gap == timedelta(0):
-        if round_up:
-            return time_stamp + timedelta(milliseconds=1)
-        return time_stamp
-    if round_up:
-        time_stamp += timedelta(microseconds=1000) - micro_s_gap
-    else:
-        time_stamp -= micro_s_gap
-    return time_stamp
 
 
 def datetime_to_hbase_ts(dt: datetime) -> int:
@@ -66,6 +46,25 @@ def build_column_specs(columns) -> list:
     return [build_column_spec(c) for c in columns]
 
 
+class RestCell(NamedTuple):
+    """One decoded REST cell: its family, its qualifier and the Cell it holds."""
+
+    family: str
+    qualifier: bytes
+    cell: Cell
+
+
+def parse_cells(cells: list[dict[str, object]]) -> list[RestCell]:
+    """Each REST cell's base64 column, value and millisecond time, decoded."""
+    parsed = []
+    for one in cells:
+        family, qualifier = decode_value(one["column"]).decode("utf-8").split(":", 1)
+        timestamp = hbase_ts_to_datetime(one.get("timestamp"))
+        cell = Cell(value=decode_value(one["$"]), timestamp=timestamp)
+        parsed.append(RestCell(family, qualifier.encode("utf-8"), cell))
+    return parsed
+
+
 def parse_cell_response(row_data: dict, single_column=False):
     """Convert HBase REST JSON row response to {_Attribute: [Cell]} dict.
 
@@ -75,7 +74,7 @@ def parse_cell_response(row_data: dict, single_column=False):
         {
           "key": "<base64>",
           "Cell": [
-            {"column": "<base64 family:qualifier>", "$": "<base64 value>", "timestamp": 123}
+            {"column": "<b64 family:qualifier>", "$": "<b64 value>", "timestamp": 123}
           ]
         }
       ]
@@ -89,19 +88,12 @@ def parse_cell_response(row_data: dict, single_column=False):
     for row in rows:
         row_key = decode_value(row["key"])
         column_dict = {}
-        for cell in row.get("Cell", []):
-            col_b64 = cell["column"]
-            col_decoded = decode_value(col_b64).decode("utf-8")
-            family_id, col_key = col_decoded.split(":", 1)
-            col_key_bytes = col_key.encode("utf-8")
+        for parsed in parse_cells(row.get("Cell", [])):
             try:
-                attr = attributes.from_key(family_id, col_key_bytes)
+                attr = attributes.from_key(parsed.family, parsed.qualifier)
             except KeyError:
                 continue
-            value = decode_value(cell["$"])
-            timestamp = hbase_ts_to_datetime(cell.get("timestamp"))
-            c = Cell(value=value, timestamp=timestamp)
-            column_dict.setdefault(attr, []).append(c)
+            column_dict.setdefault(attr, []).append(parsed.cell)
 
         if single_column and column_dict:
             # Return just the cell list for the single column
@@ -111,38 +103,41 @@ def parse_cell_response(row_data: dict, single_column=False):
     return result
 
 
-def build_cellset_json(mutations) -> dict:
-    """Build a CellSet JSON body from a list of HBaseMutation objects for PUT.
+def build_cell(
+    col_spec: str | bytes, value: bytes, timestamp: datetime | None = None
+) -> dict[str, object]:
+    """One CellSet cell: column and value in base64, its time in ms when given."""
+    column = col_spec.encode("utf-8") if isinstance(col_spec, str) else col_spec
+    cell = {"column": encode_value(column), "$": encode_value(value)}
+    if timestamp is not None:
+        cell["timestamp"] = datetime_to_hbase_ts(timestamp)
+    return cell
 
-    Returns JSON structure:
-    {
-      "Row": [
-        {
-          "key": "<base64>",
-          "Cell": [
-            {"column": "<base64>", "$": "<base64>", "timestamp": <ms>}
-          ]
-        }
-      ]
-    }
+
+def build_row(row_key: bytes, cells: list[dict[str, object]]) -> dict[str, object]:
+    """One CellSet row: its key in base64, and its cells."""
+    return {"key": encode_value(row_key), "Cell": cells}
+
+
+def build_cellset(rows: list[dict[str, object]]) -> dict[str, object]:
+    """The CellSet body every HBase REST write, increment and check sends.
+
+    {"Row": [{"key": b64, "Cell": [{"column": b64, "$": b64, "timestamp": ms}]}]}
     """
-    rows = []
-    for mutation in mutations:
-        cells = []
-        for col_spec, (value, timestamp) in mutation.cells.items():
-            cell = {
-                "column": encode_value(
-                    col_spec.encode("utf-8") if isinstance(col_spec, str) else col_spec
-                ),
-                "$": encode_value(value),
-            }
-            if timestamp is not None:
-                cell["timestamp"] = datetime_to_hbase_ts(timestamp)
-            cells.append(cell)
-        rows.append(
-            {
-                "key": encode_value(mutation.row_key),
-                "Cell": cells,
-            }
-        )
     return {"Row": rows}
+
+
+def build_cellset_json(mutations) -> dict[str, object]:
+    """The CellSet body writing each HBaseMutation in `mutations`, for PUT."""
+    return build_cellset(
+        [
+            build_row(
+                mutation.row_key,
+                [
+                    build_cell(col_spec, value, timestamp)
+                    for col_spec, (value, timestamp) in mutation.cells.items()
+                ],
+            )
+            for mutation in mutations
+        ]
+    )
