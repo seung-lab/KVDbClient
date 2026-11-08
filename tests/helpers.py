@@ -45,8 +45,10 @@ def write_nodes(client, ids) -> np.ndarray:
     return ids
 
 
-def write_log(client, op_id, user="alice", op_time=OP_TIME) -> None:
+def write_log(client, op_id, user="alice", op_time=OP_TIME, status=None) -> None:
     record = {OperationLogs.UserID: user, OperationLogs.RootID: LOG_ROOTS}
     if op_time is not None:
         record[OperationLogs.OperationTimeStamp] = op_time
+    if status is not None:
+        record[OperationLogs.Status] = status.value
     write_node(client, op_id, record, LOG_WRITTEN)
