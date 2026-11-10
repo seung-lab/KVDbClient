@@ -6,12 +6,22 @@ import pytest
 
 from kvdbclient import get_client_class
 from kvdbclient import get_config_class
+from kvdbclient.fork.marker import Hop
 from kvdbclient_testing import backends
 
+from helpers import NODE
+from helpers import OTHER
 from helpers import SMALL_BATCH
+from helpers import T1
+from helpers import T2
 from helpers import TEST_META
 from helpers import TEST_VERSION
+from helpers import TF1
+from helpers import TF2
+from helpers import create_fork
+from helpers import fork_marker
 from helpers import new_table_id
+from helpers import write_parent
 
 _HARNESSES = {harness.name: harness for harness in backends()}
 
@@ -60,3 +70,26 @@ def client_short_expiry(backend):
 @pytest.fixture
 def client_small_batch(backend):
     return backend.client(max_row_key_count=SMALL_BATCH)
+
+
+@pytest.fixture
+def source(backend):
+    """A plain table holding `NODE` at `T1` and `T2`, and `OTHER` at `T2` only."""
+    client = backend.client()
+    write_parent(client, NODE, 1, T1)
+    write_parent(client, NODE, 2, T2)
+    write_parent(client, OTHER, 3, T2)
+    return client
+
+
+@pytest.fixture
+def fork(backend, source):
+    """A fork of `source` at `TF1`, between its two writes of `NODE`."""
+    return create_fork(backend, fork_marker(Hop(source._table_id, TF1)))
+
+
+@pytest.fixture
+def second(backend, fork, source):
+    """A fork of `fork` at `TF2`, its chain running through `fork` to `source`."""
+    hops = (Hop(fork._table_id, TF2), Hop(source._table_id, TF1))
+    return create_fork(backend, fork_marker(*hops))

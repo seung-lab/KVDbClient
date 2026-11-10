@@ -14,6 +14,7 @@ from google.cloud.bigtable.data.row_filters import RowFilterChain
 from google.cloud.bigtable.data.row_filters import RowFilterUnion
 from google.cloud.bigtable.data.row_filters import ValueRangeFilter
 from google.cloud.bigtable.data.row_filters import CellsRowLimitFilter
+from google.cloud.bigtable.data.row_filters import CellsColumnLimitFilter
 from google.cloud.bigtable.data.row_filters import ColumnRangeFilter
 from google.cloud.bigtable.data.row_filters import TimestampRangeFilter
 from google.cloud.bigtable.data.row_filters import ConditionalRowFilter
@@ -131,9 +132,10 @@ def _unexpired(lock_expiry: timedelta) -> TimestampRangeFilter:
 
 
 def _held_by(lock_column, operation_id: np.uint64) -> list[RowFilter]:
-    """Filters keeping `lock_column`'s cell only while it holds `operation_id`."""
+    """Filters keeping `lock_column`'s newest cell only while it holds `operation_id`."""
     return [
         _exact_column_filter(lock_column),
+        CellsColumnLimitFilter(1),
         _exact_value_filter(lock_column.serialize(operation_id)),
     ]
 
@@ -196,17 +198,12 @@ def get_row_key_lock_filter_with_indefinite(
 
 
 def get_indefinite_root_lock_filter(lock_column) -> ConditionalRowFilter:
-    return _refused_or_superseded(get_indefinite_row_key_lock_filter(lock_column))
+    return _refused_or_superseded(get_has_column_filter(lock_column))
 
 
-def get_indefinite_row_key_lock_filter(lock_column) -> ColumnRangeFilter:
-    """Acquire-side filter for an indefinite row-key lock.
-
-    `get_indefinite_root_lock_filter` adds the NewParent hierarchy check on
-    top. A match (indefinite cell exists) means the lock is held → acquire
-    refuses.
-    """
-    return _exact_column_filter(lock_column)
+def get_has_column_filter(column: attributes._Attribute) -> ColumnRangeFilter:
+    """Matches a row holding `column`: a held indefinite lock, or a seeded counter."""
+    return _exact_column_filter(column)
 
 
 def get_held_lock_filter(
@@ -214,7 +211,7 @@ def get_held_lock_filter(
 ) -> RowFilterChain:
     """'Is this lock still held by operation_id?' for any row.
 
-    A match means the cell holds `operation_id`: a renew sets it again, and
+    A match means the newest cell holds `operation_id`: a renew sets it again, and
     an indefinite unlock deletes it.
     """
     return RowFilterChain(_held_by(lock_column, operation_id))
@@ -223,15 +220,15 @@ def get_held_lock_filter(
 def get_renew_lock_filter(
     lock_column: attributes._Attribute, operation_id: np.uint64
 ) -> ConditionalRowFilter:
-    # Root renew is inverted vs the row-key version: renew only when
-    # (my lock exists) AND (no NewParent). Layers a NewParent guard on
-    # top of the generic "is my lock still here" check, and flips the
-    # expected case so `check_and_mutate_row` runs SetCell as
-    # `false_case_mutations`.
+    """Yields cells only while `operation_id` holds the root's newest lock.
+
+    A root with a NewParent yields none. Renewals set the lock on a match, so a row
+    nobody locked, such as a fork's inherited root, never renews.
+    """
     return ConditionalRowFilter(
-        predicate_filter=get_held_lock_filter(lock_column, operation_id),
-        true_filter=_new_parent_filter(),
-        false_filter=PassAllFilter(True),
+        predicate_filter=_new_parent_filter(),
+        true_filter=BlockAllFilter(True),
+        false_filter=get_held_lock_filter(lock_column, operation_id),
     )
 
 

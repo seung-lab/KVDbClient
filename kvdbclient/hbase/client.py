@@ -162,15 +162,12 @@ class Client(ClientWithIDGen, OperationLogger):
         )
         resp.raise_for_status()
 
-    def _put_lock_if_absent(
-        self, row_key: bytes, operation_id: np.uint64, lock_column
-    ) -> bool:
-        """Writes `operation_id` to `lock_column`, stamped now, only if absent."""
+    def _put_if_absent(self, row_key: bytes, column, value) -> bool:
         return self._check_and_put(
             row_key,
-            lock_column,
+            column,
             check_value=None,
-            put_value=lock_column.serialize(operation_id),
+            put_value=column.serialize(value),
             put_timestamp=get_valid_timestamp(None),
         )
 
@@ -183,7 +180,7 @@ class Client(ClientWithIDGen, OperationLogger):
         HBase REST check-and-put has no server-side TTL, so expiry is
         enforced client-side against `self._lock_expiry`.
         """
-        if self._put_lock_if_absent(row_key, operation_id, lock_column):
+        if self._put_if_absent(row_key, lock_column, operation_id):
             return True
         cells = self._read_byte_row(row_key, columns=lock_column)
         if cells:
@@ -203,16 +200,16 @@ class Client(ClientWithIDGen, OperationLogger):
         cell = hbase_utils.build_cell(col_spec, lock_column.serialize(operation_id))
         return self._check(row_key, col_spec, "delete", [cell])
 
-    def lock_root(self, root_id: np.uint64, operation_id: np.uint64) -> bool:
-        return self.lock_by_row_key_with_indefinite(
+    def _lock_root(self, root_id: np.uint64, operation_id: np.uint64) -> bool:
+        return self._lock_by_row_key_with_indefinite(
             serialize_uint64(root_id), operation_id
         )
 
-    def lock_root_indefinitely(
+    def _lock_root_indefinitely(
         self, root_id: np.uint64, operation_id: np.uint64
     ) -> bool:
         row_key = serialize_uint64(root_id)
-        if self.lock_by_row_key_indefinitely(row_key, operation_id):
+        if self._lock_by_row_key_indefinitely(row_key, operation_id):
             return True
         if self.logger.isEnabledFor(logging.DEBUG):
             lock_column = attributes.Concurrency.IndefiniteLock
@@ -229,7 +226,7 @@ class Client(ClientWithIDGen, OperationLogger):
             row_key, operation_id, attributes.Concurrency.Lock
         )
 
-    def lock_by_row_key_with_indefinite(
+    def _lock_by_row_key_with_indefinite(
         self, row_key: bytes, operation_id: np.uint64
     ) -> bool:
         """Temporal lock on a row key that also refuses if indefinite is held.
@@ -245,17 +242,6 @@ class Client(ClientWithIDGen, OperationLogger):
             self._delete_column(row_key, lock_column)
             return False
         return True
-
-    def lock_by_row_key_indefinitely(
-        self, row_key: bytes, operation_id: np.uint64
-    ) -> bool:
-        """Indefinite-column CAS on a row key.
-
-        Indefinite locks never expire, so a stale-looking cell is still held:
-        this skips `_acquire_lock_cell`, which deletes expired cells.
-        """
-        lock_column = attributes.Concurrency.IndefiniteLock
-        return bool(self._put_lock_if_absent(row_key, operation_id, lock_column))
 
     def unlock_by_row_key(self, row_key: bytes, operation_id: np.uint64):
         return self._release_lock_cell(

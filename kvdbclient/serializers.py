@@ -59,8 +59,9 @@ class NumPyArray(_Serializer):
 class NumPyValue(_Serializer):
     def __init__(self, dtype):
         super().__init__(
+            # astype swaps bytes into the column's order; view would only relabel them.
             serializer=lambda x: np.asarray(x)
-            .view(np.dtype(type(x)).newbyteorder(dtype.byteorder))
+            .astype(np.dtype(type(x)).newbyteorder(dtype.byteorder))
             .tobytes(),
             deserializer=lambda x: np.frombuffer(x, dtype=dtype)[0],
             basetype=dtype.type,
