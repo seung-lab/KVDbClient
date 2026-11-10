@@ -220,6 +220,12 @@ def _flatten_log(record: dict[attributes._Attribute, list]) -> datetime:
     return timestamp
 
 
+def _newest(row: dict[attributes._Attribute, list], column):
+    """The newest value of `column` in a read `row`, or None when it holds none."""
+    cells = row.get(column)
+    return cells[0].value if cells else None
+
+
 class SimpleClient(ABC):
     """
     Abstract class for interacting with backend data store.
@@ -229,6 +235,10 @@ class SimpleClient(ABC):
     backend_name = None
     config_class = None
     default_client_info = None
+    # Whether this client reads a fork's table through its sources; plain ones refuse it.
+    opens_forks = False
+    # The open table's fork marker; None for a plain table.
+    marker = None
 
     def __init_subclass__(cls, **kwargs):
         """Registers a subclass declaring ``backend_name``; an incomplete one fails."""
@@ -464,13 +474,25 @@ class SimpleClient(ABC):
         if overwrite:
             self._delete_meta()
         self._table_meta = meta
-        self._write_cell(attributes.TableMeta.key, attributes.TableMeta.Meta, meta)
+        self.write([self.mutate_row(attributes.TableMeta.key, self._meta_row(meta))])
+
+    def _meta_row(self, meta) -> dict[attributes._Attribute, typing.Any]:
+        """The meta row's values holding `meta`."""
+        return {attributes.TableMeta.Meta: meta}
 
     def read_table_meta(self):
-        self._table_meta = self._read_cell(
-            attributes.TableMeta.key, attributes.TableMeta.Meta
-        )
+        row = self._read_byte_row(attributes.TableMeta.key)
+        marker = _newest(row, attributes.TableMeta.Fork)
+        if marker is not None:
+            self._open_fork(marker)
+        self._table_meta = _newest(row, attributes.TableMeta.Meta)
         return self._table_meta
+
+    def _open_fork(self, marker: str) -> None:
+        """Refuses a fork's table: this client cannot read below its fork time."""
+        raise exceptions.ForkTableError(
+            f"{self._table_id} is a fork; {type(self).__name__} reads only its own table"
+        )
 
     def _write_cell(self, row_key: bytes, column, value) -> None:
         """Writes `value` to `column` of row `row_key`."""
@@ -478,11 +500,7 @@ class SimpleClient(ABC):
 
     def _read_cell(self, row_key: bytes, column):
         """The newest value in `column` of row `row_key`, or None when it holds none."""
-        row = self._read_byte_row(row_key)
-        try:
-            return row[column][0].value
-        except KeyError:
-            return None
+        return _newest(self._read_byte_row(row_key), column)
 
     def read_nodes(
         self,

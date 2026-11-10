@@ -219,6 +219,10 @@ class GraphSettings:
 class TableMeta:
     key = b"meta"
     Meta = _Attribute(key=key, family_id="0", serializer=serializers.Pickle())
+    # Only a fork's table holds it: the fork's marker, as `kvdbclient.fork.marker` JSON.
+    Fork = _Attribute(
+        key=b"fork", family_id="0", serializer=serializers.String("utf-8")
+    )
 
 
 class TableVersion:

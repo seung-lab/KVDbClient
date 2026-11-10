@@ -1,5 +1,4 @@
 # pylint: disable=missing-docstring, redefined-outer-name
-import uuid
 from datetime import timedelta
 from typing import NamedTuple
 
@@ -12,6 +11,7 @@ from kvdbclient_testing import backends
 from helpers import SMALL_BATCH
 from helpers import TEST_META
 from helpers import TEST_VERSION
+from helpers import new_table_id
 
 _HARNESSES = {harness.name: harness for harness in backends()}
 
@@ -24,9 +24,8 @@ class Backend(NamedTuple):
         config = self.config
         if max_row_key_count is not None:
             config = config._replace(MAX_ROW_KEY_COUNT=max_row_key_count)
-        table_id = f"test_{uuid.uuid4().hex[:12]}"
         client = get_client_class(self.name)(
-            table_id=table_id, config=config, **options
+            table_id=new_table_id(), config=config, **options
         )
         if create_table:
             client.create_table(meta=TEST_META, version=TEST_VERSION)

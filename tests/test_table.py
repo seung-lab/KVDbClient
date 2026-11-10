@@ -66,6 +66,10 @@ class TestTableMeta:
         client._delete_meta()
         assert client.read_table_meta() is None
 
+    def test_a_plain_table_has_no_fork_marker(self, client):
+        client.read_table_meta()
+        assert client.marker is None
+
 
 class TestTableVersion:
     def test_reads_the_created_version(self, client):

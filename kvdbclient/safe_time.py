@@ -8,6 +8,7 @@ import numpy as np
 
 from . import attributes
 from . import basetypes
+from .utils import TICK
 from .utils import get_valid_timestamp
 
 _LOGS = attributes.OperationLogs
@@ -21,8 +22,6 @@ FINISHED = frozenset(
 )
 #: How many op ids one read of the op log covers.
 PAGE = 1000
-#: Bigtable keeps millisecond timestamps, so one tick is the step below an edit.
-TICK = timedelta(milliseconds=1)
 #: How long a waiting search sleeps between reads.
 POLL = timedelta(seconds=10)
 #: The longest an edit takes from its op id to its CREATED log; until then it is unseen.

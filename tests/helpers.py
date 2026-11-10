@@ -1,3 +1,4 @@
+import uuid
 from datetime import datetime, timedelta, timezone
 
 import numpy as np
@@ -6,6 +7,11 @@ from kvdbclient import attributes
 from kvdbclient import basetypes
 from kvdbclient.attributes import OperationLogs
 from kvdbclient.serializers import serialize_uint64
+
+
+def new_table_id() -> str:
+    return f"test_{uuid.uuid4().hex[:12]}"
+
 
 CHILD = attributes.Hierarchy.Child
 TEST_META = {"test": True}
