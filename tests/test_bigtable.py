@@ -7,6 +7,7 @@ from google.cloud.bigtable.column_family import GCRuleIntersection
 from google.cloud.bigtable.column_family import MaxAgeGCRule
 from google.cloud.bigtable.column_family import MaxVersionsGCRule
 
+from kvdbclient import attributes
 from kvdbclient.base import ColumnFamilyConfig
 
 from helpers import CHILD
@@ -18,9 +19,11 @@ from helpers import write_node
 pytestmark = pytest.mark.parametrize("backend", ["bigtable"], indirect=True)
 
 
-def test_renewing_an_unheld_root_lock_takes_it(client):
-    assert client.renew_lock(np.uint64(100), np.uint64(1)) is True
-    assert client.renew_lock(np.uint64(100), np.uint64(2)) is False
+def test_renewing_a_superseded_root_lock_fails(client):
+    root, op = np.uint64(100), np.uint64(1)
+    client.lock_root(root, op)
+    write_node(client, root, {attributes.Hierarchy.NewParent: node_ids(200)})
+    assert client.renew_lock(root, op) is False
 
 
 def test_a_user_filter_keeps_that_user_s_ops(client):

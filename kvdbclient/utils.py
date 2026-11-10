@@ -5,6 +5,9 @@ from typing import NamedTuple
 
 import pytz
 
+# Storage keeps time to the millisecond, so one tick is the next instant it tells apart.
+TICK = datetime.timedelta(milliseconds=1)
+
 
 def get_max_time():
     """Returns the (almost) max time in datetime.datetime."""
@@ -35,7 +38,7 @@ def get_compatible_time_stamp(
     """
     micro_s_gap = datetime.timedelta(microseconds=time_stamp.microsecond % 1000)
     if round_up:
-        return time_stamp + (datetime.timedelta(microseconds=1000) - micro_s_gap)
+        return time_stamp + (TICK - micro_s_gap)
     return time_stamp - micro_s_gap
 
 

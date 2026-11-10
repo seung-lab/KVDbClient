@@ -50,6 +50,9 @@ class TestRootLock:
         client.lock_root(ROOT, OP)
         assert client.renew_lock(ROOT, OTHER_OP) is False
 
+    def test_renew_of_a_root_nobody_locked_fails(self, client):
+        assert client.renew_lock(ROOT, OP) is False
+
     def test_a_refusal_logs_the_holders_at_debug(self, client, caplog):
         caplog.set_level(logging.DEBUG, logger=client.logger.name)
         client.lock_root(ROOT, OP)
@@ -246,3 +249,18 @@ class TestLockExpiry:
     def test_an_unexpired_lock_holds(self, client_short_expiry):
         client_short_expiry.lock_root(ROOT, OP)
         assert client_short_expiry.lock_root(ROOT, OTHER_OP) is False
+
+    @pytest.mark.parametrize(
+        "lock, renew, key",
+        [
+            ("lock_root", "renew_lock", ROOT),
+            ("lock_by_row_key", "renew_lock_by_row_key", ROW),
+        ],
+    )
+    def test_a_retaken_lock_refuses_its_old_holder_s_renew(
+        self, client_short_expiry, lock, renew, key
+    ):
+        getattr(client_short_expiry, lock)(key, OP)
+        time.sleep(1.5)
+        getattr(client_short_expiry, lock)(key, OTHER_OP)
+        assert getattr(client_short_expiry, renew)(key, OP) is False

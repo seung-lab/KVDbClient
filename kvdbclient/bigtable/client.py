@@ -113,8 +113,9 @@ def _gc_rule(column_family: ColumnFamilyConfig):
 
 
 class Client(ClientWithIDGen, OperationLogger):
-    backend_name = "bigtable"
     config_class = BigTableConfig
+    DATA_HANDLE = "_table"
+    READ_CALLS = frozenset({"read_row", "read_rows", "read_rows_stream"})
 
     @staticmethod
     def default_client_info():
@@ -126,14 +127,18 @@ class Client(ClientWithIDGen, OperationLogger):
         config: BigTableConfig = BigTableConfig(),
         table_meta=None,
         lock_expiry: timedelta = timedelta(minutes=3),
+        data_client: typing.Optional[BigtableDataClient] = None,
     ):
         # Store config for lazy admin client creation
         self._config = config
         self._table_id = table_id
         self.__admin_table = None
 
-        # Data client (new — all read/write/lock operations)
-        self._data_client = BigtableDataClient(**_client_kwargs(config))
+        # A data client passed in is shared, and closed only by the client that made it.
+        owns_data_client = data_client is None
+        if owns_data_client:
+            data_client = BigtableDataClient(**_client_kwargs(config))
+        self._data_client = data_client
         self._table = self._data_client.get_table(
             config.INSTANCE,
             table_id,
@@ -159,11 +164,14 @@ class Client(ClientWithIDGen, OperationLogger):
             lock_expiry=lock_expiry,
             max_row_key_count=config.MAX_ROW_KEY_COUNT,
         )
-        self._finalizer = weakref.finalize(self, _close_quietly, self._data_client)
-        atexit.register(self._finalizer)
+        self._finalizer = None
+        if owns_data_client:
+            self._finalizer = weakref.finalize(self, _close_quietly, self._data_client)
+            atexit.register(self._finalizer)
 
     def close(self):
-        self._finalizer()
+        if self._finalizer is not None:
+            self._finalizer()
 
     @property
     def _admin_table(self):
@@ -252,6 +260,19 @@ class Client(ClientWithIDGen, OperationLogger):
             row_key, predicate, false_case_mutations=mutation
         )
 
+    def _set_lock_if(
+        self,
+        row_key: bytes,
+        predicate: RowFilter,
+        lock_column: attributes._Attribute,
+        operation_id: np.uint64,
+    ) -> bool:
+        """Writes the lock cell when `predicate` matches; True when it wrote."""
+        mutation = _set_lock_mutation(lock_column, operation_id)
+        return bool(
+            self._check_and_mutate(row_key, predicate, true_case_mutations=mutation)
+        )
+
     def _delete_lock_if(
         self, row_key: bytes, predicate: RowFilter, lock_column: attributes._Attribute
     ) -> bool:
@@ -262,60 +283,55 @@ class Client(ClientWithIDGen, OperationLogger):
         mutation = _delete_range(lock_column)
         return self._check_and_mutate(row_key, predicate, true_case_mutations=mutation)
 
-    def _lock_root_unless(
+    def _acquire(
         self,
-        root_id: np.uint64,
+        row_key: bytes,
         predicate: RowFilter,
         lock_column: attributes._Attribute,
         operation_id: np.uint64,
         log_prefix: str,
     ) -> bool:
-        """Locks `lock_column` on `root_id` unless `predicate` matches.
+        """Locks `lock_column` on `row_key` unless `predicate` matches.
 
         True when locked. A refusal logs `log_prefix` and the holding op ids, at debug.
         """
-        row_key = serialize_uint64(root_id)
         acquired = self._set_lock_unless(row_key, predicate, lock_column, operation_id)
         if not acquired and self.logger.isEnabledFor(logging.DEBUG):
             row = self._read_byte_row(row_key, columns=lock_column)
             log_lock_holders(self.logger, log_prefix, row)
         return acquired
 
-    def lock_root(self, root_id: np.uint64, operation_id: np.uint64) -> bool:
+    def _lock_root(self, root_id: np.uint64, operation_id: np.uint64) -> bool:
         lock_column = attributes.Concurrency.Lock
         indefinite_lock_column = attributes.Concurrency.IndefiniteLock
         filter_ = utils.get_root_lock_filter(
             lock_column, self._lock_expiry, indefinite_lock_column
         )
-        return self._lock_root_unless(
-            root_id, filter_, lock_column, operation_id, "Locked"
-        )
+        row_key = serialize_uint64(root_id)
+        return self._acquire(row_key, filter_, lock_column, operation_id, "Locked")
 
-    def lock_root_indefinitely(
+    def _lock_root_indefinitely(
         self, root_id: np.uint64, operation_id: np.uint64
     ) -> bool:
         lock_column = attributes.Concurrency.IndefiniteLock
         filter_ = utils.get_indefinite_root_lock_filter(lock_column)
-        return self._lock_root_unless(
-            root_id, filter_, lock_column, operation_id, "Indefinitely locked"
+        row_key = serialize_uint64(root_id)
+        return self._acquire(
+            row_key, filter_, lock_column, operation_id, "Indefinitely locked"
         )
 
     def renew_lock(self, root_id: np.uint64, operation_id: np.uint64) -> bool:
-        # Root-specific: ConditionalRowFilter inverts the usual renew
-        # semantics, so a root renew sets the cell unless the filter matches
-        # (see `get_renew_lock_filter`); `renew_lock_by_row_key` sets it when
-        # its filter matches.
         lock_column = attributes.Concurrency.Lock
         row_key = serialize_uint64(root_id)
         filter_ = utils.get_renew_lock_filter(lock_column, operation_id)
-        return self._set_lock_unless(row_key, filter_, lock_column, operation_id)
+        return self._set_lock_if(row_key, filter_, lock_column, operation_id)
 
     def lock_by_row_key(self, row_key: bytes, operation_id: np.uint64) -> bool:
         lock_column = attributes.Concurrency.Lock
         filter_ = utils.get_row_key_lock_filter(lock_column, self._lock_expiry)
         return self._set_lock_unless(row_key, filter_, lock_column, operation_id)
 
-    def lock_by_row_key_with_indefinite(
+    def _lock_by_row_key_with_indefinite(
         self, row_key: bytes, operation_id: np.uint64
     ) -> bool:
         """Temporal lock on a row key that also refuses if indefinite is held.
@@ -329,19 +345,13 @@ class Client(ClientWithIDGen, OperationLogger):
         filter_ = utils.get_row_key_lock_filter_with_indefinite(
             lock_column, self._lock_expiry, indefinite_lock_column
         )
-        return self._set_lock_unless(row_key, filter_, lock_column, operation_id)
+        return self._acquire(row_key, filter_, lock_column, operation_id, "Locked")
 
-    def lock_by_row_key_indefinitely(
-        self, row_key: bytes, operation_id: np.uint64
+    def _put_if_absent(
+        self, row_key: bytes, column: attributes._Attribute, value
     ) -> bool:
-        """Indefinite-column CAS on a row key. No expiry semantics — a
-        cell here persists until explicitly released (or a worker
-        recovery path clears it). Counterpart to `lock_root_indefinitely`
-        for hierarchy-free rows.
-        """
-        lock_column = attributes.Concurrency.IndefiniteLock
-        filter_ = utils.get_indefinite_row_key_lock_filter(lock_column)
-        return self._set_lock_unless(row_key, filter_, lock_column, operation_id)
+        filter_ = utils.get_has_column_filter(column)
+        return self._set_lock_unless(row_key, filter_, column, value)
 
     def unlock_by_row_key(self, row_key: bytes, operation_id: np.uint64):
         lock_column = attributes.Concurrency.Lock
@@ -365,10 +375,7 @@ class Client(ClientWithIDGen, OperationLogger):
     def renew_lock_by_row_key(self, row_key: bytes, operation_id: np.uint64) -> bool:
         lock_column = attributes.Concurrency.Lock
         filter_ = utils.get_held_lock_filter(lock_column, operation_id)
-        mutation = _set_lock_mutation(lock_column, operation_id)
-        return bool(
-            self._check_and_mutate(row_key, filter_, true_case_mutations=mutation)
-        )
+        return self._set_lock_if(row_key, filter_, lock_column, operation_id)
 
     def _get_ids_range(self, key: bytes, size: int) -> typing.Tuple:
         column = attributes.Concurrency.Counter

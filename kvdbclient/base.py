@@ -60,6 +60,19 @@ def shard_segment_id(value, shard):
     return value * np.uint64(COUNTER_SHARDS) + shard
 
 
+class CounterRow(typing.NamedTuple):
+    """The chunk a counter row counts for, and its shard; None for the unsharded row."""
+
+    chunk_id: np.uint64
+    shard: typing.Optional[int]
+
+
+def counter_row(key: bytes) -> CounterRow:
+    """What `counter_key` or `counter_shard_key` built `key` from."""
+    chunk, _, shard = key[1:].partition(b"_")
+    return CounterRow(np.uint64(int(chunk)), int(shard) if shard else None)
+
+
 class Cell:
     """Backend-agnostic cell representation.
 
@@ -220,6 +233,12 @@ def _flatten_log(record: dict[attributes._Attribute, list]) -> datetime:
     return timestamp
 
 
+def _newest(row: dict[attributes._Attribute, list], column):
+    """The newest value of `column` in a read `row`, or None when it holds none."""
+    cells = row.get(column)
+    return cells[0].value if cells else None
+
+
 class SimpleClient(ABC):
     """
     Abstract class for interacting with backend data store.
@@ -229,6 +248,14 @@ class SimpleClient(ABC):
     backend_name = None
     config_class = None
     default_client_info = None
+    # Whether this client reads a fork's table through its sources; plain ones refuse it.
+    opens_forks = False
+    # The open table's fork marker; None for a plain table.
+    marker = None
+    # Attribute holding backend's data handle, and that handle's read-only calls;
+    # upstream of a fork, only those pass.
+    DATA_HANDLE = ""
+    READ_CALLS: frozenset[str] = frozenset()
 
     def __init_subclass__(cls, **kwargs):
         """Registers a subclass declaring ``backend_name``; an incomplete one fails."""
@@ -317,13 +344,32 @@ class SimpleClient(ABC):
     def _write_rows(self, rows, slow_retry=True, block_size=2000):
         """Backend-specific bulk write implementation."""
 
-    @abstractmethod
-    def lock_root(self, node_id, operation_id):
+    def _lock_refused(self, row_key: bytes) -> bool:
+        """Whether this table refuses a lock on `row_key` before any compare-and-set.
+
+        A plain table never does; a fork refuses rows an inherited op left half-written.
+        """
+        return False
+
+    def lock_root(self, node_id, operation_id) -> bool:
         """Locks root node with operation_id to prevent race conditions."""
+        if self._lock_refused(serialize_uint64(node_id)):
+            return False
+        return self._lock_root(node_id, operation_id)
 
     @abstractmethod
-    def lock_root_indefinitely(self, node_id, operation_id):
+    def _lock_root(self, node_id, operation_id) -> bool:
+        """The backend's temporal root lock, asked only once the table allows it."""
+
+    def lock_root_indefinitely(self, node_id, operation_id) -> bool:
         """Locks root node with operation_id to prevent race conditions."""
+        if self._lock_refused(serialize_uint64(node_id)):
+            return False
+        return self._lock_root_indefinitely(node_id, operation_id)
+
+    @abstractmethod
+    def _lock_root_indefinitely(self, node_id, operation_id) -> bool:
+        """The backend's indefinite root lock, asked only once the table allows it."""
 
     def unlock_root(self, root_id: np.uint64, operation_id: np.uint64):
         """Unlocks root node that is locked with operation_id."""
@@ -350,8 +396,7 @@ class SimpleClient(ABC):
         encoding. Returns True if acquired.
         """
 
-    @abstractmethod
-    def lock_by_row_key_with_indefinite(self, row_key, operation_id):
+    def lock_by_row_key_with_indefinite(self, row_key, operation_id) -> bool:
         """Temporal lock on a row key that also refuses if an indefinite
         lock cell exists on the same row.
 
@@ -361,13 +406,32 @@ class SimpleClient(ABC):
         succeed against a row whose indefinite cell was left set by a
         crashed worker.
         """
+        if self._lock_refused(row_key):
+            return False
+        return self._lock_by_row_key_with_indefinite(row_key, operation_id)
 
     @abstractmethod
-    def lock_by_row_key_indefinitely(self, row_key, operation_id):
+    def _lock_by_row_key_with_indefinite(self, row_key, operation_id) -> bool:
+        """The backend's guarded temporal lock, asked only once the table allows it."""
+
+    @abstractmethod
+    def _put_if_absent(self, row_key: bytes, column, value) -> bool:
+        """Writes `value` to `column`, stamped now, if absent; True if written."""
+
+    def lock_by_row_key_indefinitely(self, row_key, operation_id) -> bool:
         """Acquire the indefinite-column cell on a row key. No expiry;
         persists until released or cleared by operator recovery. Row-key
         counterpart to `lock_root_indefinitely`.
         """
+        if self._lock_refused(row_key):
+            return False
+        return self._lock_by_row_key_indefinitely(row_key, operation_id)
+
+    def _lock_by_row_key_indefinitely(self, row_key, operation_id) -> bool:
+        """Shared indefinite lock: never expires, so only an absent cell is taken."""
+        return self._put_if_absent(
+            row_key, attributes.Concurrency.IndefiniteLock, operation_id
+        )
 
     @abstractmethod
     def unlock_by_row_key(self, row_key, operation_id):
@@ -464,13 +528,25 @@ class SimpleClient(ABC):
         if overwrite:
             self._delete_meta()
         self._table_meta = meta
-        self._write_cell(attributes.TableMeta.key, attributes.TableMeta.Meta, meta)
+        self.write([self.mutate_row(attributes.TableMeta.key, self._meta_row(meta))])
+
+    def _meta_row(self, meta) -> dict[attributes._Attribute, typing.Any]:
+        """The meta row's values holding `meta`."""
+        return {attributes.TableMeta.Meta: meta}
 
     def read_table_meta(self):
-        self._table_meta = self._read_cell(
-            attributes.TableMeta.key, attributes.TableMeta.Meta
-        )
+        row = self._read_byte_row(attributes.TableMeta.key)
+        marker = _newest(row, attributes.TableMeta.Fork)
+        if marker is not None:
+            self._open_fork(marker)
+        self._table_meta = _newest(row, attributes.TableMeta.Meta)
         return self._table_meta
+
+    def _open_fork(self, marker: str) -> None:
+        """Refuses a fork's table: this client cannot read below its fork time."""
+        raise exceptions.ForkTableError(
+            f"{self._table_id} is a fork; {type(self).__name__} reads only its own table"
+        )
 
     def _write_cell(self, row_key: bytes, column, value) -> None:
         """Writes `value` to `column` of row `row_key`."""
@@ -478,11 +554,7 @@ class SimpleClient(ABC):
 
     def _read_cell(self, row_key: bytes, column):
         """The newest value in `column` of row `row_key`, or None when it holds none."""
-        row = self._read_byte_row(row_key)
-        try:
-            return row[column][0].value
-        except KeyError:
-            return None
+        return _newest(self._read_byte_row(row_key), column)
 
     def read_nodes(
         self,

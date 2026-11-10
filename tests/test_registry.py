@@ -1,7 +1,11 @@
 """Backend registry, resolution and self-registration; no live backend needed."""
 
+import ast
+from pathlib import Path
+
 import pytest
 
+import kvdbclient.fork
 from kvdbclient import available_backends
 from kvdbclient import get_client_class
 from kvdbclient import get_config_class
@@ -10,7 +14,7 @@ from kvdbclient import registry
 from kvdbclient.base import SimpleClient
 from kvdbclient.bigtable import BigTableConfig
 from kvdbclient.bigtable import get_client_info as get_bigtable_client_info
-from kvdbclient.bigtable.client import Client as BigTableClient
+from kvdbclient import BigTableClient
 from kvdbclient.hbase import HBaseConfig
 from kvdbclient.hbase import get_client_info as get_hbase_client_info
 from kvdbclient.hbase.client import Client as HBaseClient
@@ -29,6 +33,21 @@ def test_builtin_backends_are_available():
     assert set(available_backends()) >= {"bigtable", "hbase"}
 
 
+def test_the_fork_package_imports_no_backend():
+    """Backend code lives in its backend's package; the fork package serves all."""
+    sources = sorted(Path(kvdbclient.fork.__path__[0]).glob("*.py"))
+    imported = set()
+    for path in sources:
+        for node in ast.walk(ast.parse(path.read_text())):
+            if isinstance(node, ast.ImportFrom):
+                imported.add(node.module or "")
+            elif isinstance(node, ast.Import):
+                imported.update(alias.name for alias in node.names)
+    backends = {"bigtable", "hbase", "google", "requests"}
+    assert sources
+    assert not [module for module in imported if backends & set(module.split("."))]
+
+
 @pytest.mark.parametrize(
     "name, client_class, config_class",
     [
@@ -42,6 +61,11 @@ def test_builtin_backends_are_available():
 def test_a_name_resolves_its_classes(name, client_class, config_class):
     assert get_client_class(name) is client_class
     assert get_config_class(name) is config_class
+
+
+@pytest.mark.parametrize("name, opens", [("bigtable", True), ("hbase", False)])
+def test_only_the_registered_bigtable_client_opens_forks(name, opens):
+    assert get_client_class(name).opens_forks is opens
 
 
 def test_an_unknown_backend_raises():
